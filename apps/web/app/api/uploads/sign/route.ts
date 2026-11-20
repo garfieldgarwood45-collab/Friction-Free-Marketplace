@@ -29,7 +29,7 @@ function extensionFor(name: string, fallback: string) {
 
 export async function POST(request: Request) {
   if (!isTrustedMutationOrigin(request)) return NextResponse.json({ error: "Invalid request origin." }, { status: 403 });
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Authentication required." }, { status: 401 });
 
@@ -74,6 +74,7 @@ export async function POST(request: Request) {
     uploads.push({
       path,
       token: signedUpload.token,
+      signedUrl: signedUpload.signedUrl,
       publicUrl,
       fileName: file.name,
       contentType: file.type,

@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { ConversationSummary, MessagingUser } from "./types";
+import { assertConversationParticipant } from "@/lib/messaging/permissions";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 type EmbeddedUser = {
@@ -68,10 +69,33 @@ export async function getConversationSummaries(supabase: SupabaseClient<any>, us
     .limit(50);
 
   if (error) throw error;
-  return Promise.all(((data ?? []) as Array<ConversationSummary & { buyer: EmbeddedUser; seller: EmbeddedUser }>).map(normalizeConversation));
+  const summaries = await Promise.all(((data ?? []) as Array<ConversationSummary & { buyer: EmbeddedUser; seller: EmbeddedUser }>).map(normalizeConversation));
+  return applyPublicProfiles(supabase, summaries);
 }
 
-export async function getConversationSummaryById(supabase: SupabaseClient<any>, conversationId: string) {
+async function applyPublicProfiles(supabase: SupabaseClient<any>, summaries: ConversationSummary[]) {
+  const ids = [...new Set(summaries.flatMap((summary) => [summary.buyer_id, summary.seller_id]).filter(Boolean))];
+  if (!ids.length) return summaries;
+  const { data } = await supabase.from("public_profiles").select("user_id,display_name,avatar_url").in("user_id", ids);
+  const profiles = new Map(((data ?? []) as Array<{ user_id: string; display_name: string; avatar_url: string | null }>).map((profile) => [profile.user_id, profile]));
+  const withPublicProfile = (existing: { user_id: string; display_name: string; avatar_url: string | null } | null, userId: string | null) => {
+    if (!userId) return existing;
+    const profile = profiles.get(userId);
+    if (!existing && !profile) return existing;
+    return {
+      user_id: userId,
+      display_name: profile?.display_name ?? existing?.display_name ?? "Marketplace user",
+      avatar_url: profile?.avatar_url ?? existing?.avatar_url ?? null
+    };
+  };
+  return summaries.map((summary) => ({
+    ...summary,
+    buyer: withPublicProfile(summary.buyer, summary.buyer_id),
+    seller: withPublicProfile(summary.seller, summary.seller_id)
+  }));
+}
+
+export async function getConversationSummaryById(supabase: SupabaseClient<any>, conversationId: string, userId: string) {
   const { data, error } = await (supabase as any)
     .from("conversations")
     .select(conversationSummarySelect)
@@ -80,5 +104,8 @@ export async function getConversationSummaryById(supabase: SupabaseClient<any>, 
     .single();
 
   if (error) throw error;
-  return normalizeConversation(data as ConversationSummary & { buyer: EmbeddedUser; seller: EmbeddedUser });
+  const summary = await normalizeConversation(data as ConversationSummary & { buyer: EmbeddedUser; seller: EmbeddedUser });
+  assertConversationParticipant(summary, userId);
+  const [withProfile] = await applyPublicProfiles(supabase, [summary]);
+  return withProfile ?? summary;
 }

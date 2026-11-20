@@ -4,7 +4,6 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
   AlertTriangle,
-  ArrowRight,
   BadgeCheck,
   CalendarDays,
   CheckCircle2,
@@ -16,8 +15,6 @@ import {
   Info,
   LockKeyhole,
   MapPin,
-  MessageSquare,
-  PackageCheck,
   ScanSearch,
   ShieldAlert,
   ShieldCheck,
@@ -29,12 +26,19 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { createMediaViewerItem, MediaViewer, type MediaViewerItem } from "@/components/media/media-viewer";
+import { MediaViewer, type MediaViewerItem } from "@/components/media/media-viewer";
 import { createClient } from "@/lib/supabase/server";
 import { FavoriteToggleForm } from "@/components/favorites/favorite-toggle-form";
 import { ShareListingButton } from "@/components/listings/share-listing-button";
 import { CheckoutCard } from "@/components/payments/checkout-card";
+import { isDemoMarketplaceDataEnabled } from "@/lib/marketplace/demo-mode";
+import { ListingBuyBar } from "@/components/payments/listing-buy-bar";
+import { StripeJsScript } from "@/components/security/nonce-script";
+import { quoteCheckoutAmounts } from "@/lib/payments/quote";
+import { normalizeCurrency } from "@/lib/payments/money";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { StartConversationCard } from "@/components/messaging/start-conversation-card";
+import { MakeOfferSheet } from "@/components/offers/make-offer-sheet";
 import { PriceDisplay, TrustBadge } from "@/components/marketplace-design-system";
 import { PublicListingGrid } from "@/components/public-listing-grid";
 import { getFeaturedListings, getListingById, getPublicListingParams } from "@/lib/public-marketplace";
@@ -92,7 +96,7 @@ type DbListing = {
 
 async function getDatabaseListing(id: string) {
   try {
-    const supabase = createClient();
+    const supabase = await createClient();
     const { data, error } = await supabase
       .from("listings")
       .select("id,title,description,condition,price_amount,currency,seller_id,location_city,location_region,ships_to,pickup_available,metadata,listing_images(public_url,alt_text)")
@@ -173,10 +177,23 @@ function numberValue(value: unknown) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function rewriteMarketplaceAssetUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
+    if (supabaseUrl && /placeholder/i.test(parsed.hostname)) {
+      return new URL(`${parsed.pathname}${parsed.search}`, supabaseUrl).toString();
+    }
+  } catch {
+    // Keep the stored URL when it is not an absolute path we can rewrite.
+  }
+  return url;
+}
+
 function galleryImages(listing: DiscoveryDocument, dbListing: DbListing | null) {
   const urls = [
-    ...(dbListing?.listing_images ?? []).flatMap((image) => image.public_url ? [{ src: image.public_url, alt: image.alt_text || listing.title }] : []),
-    ...(listing.image_url ? [{ src: listing.image_url, alt: listing.title }] : [])
+    ...(dbListing?.listing_images ?? []).flatMap((image) => image.public_url ? [{ src: rewriteMarketplaceAssetUrl(image.public_url), alt: image.alt_text || listing.title }] : []),
+    ...(listing.image_url ? [{ src: rewriteMarketplaceAssetUrl(listing.image_url), alt: listing.title }] : [])
   ];
   const seen = new Set<string>();
   return urls.filter((image) => {
@@ -195,7 +212,7 @@ function buildAiInsights(listing: DiscoveryDocument, aiListing: Record<string, u
       : "Price confidence is limited. Ask for receipts, serial numbers, or proof of condition.";
   const fraudInsight = fraudScore === null
     ? `${Math.round(listing.safety_score || listing.seller_trust_score)}% safety score based on public seller and listing signals.`
-    : `Risk score is ${fraudScore}/100. Lower scores mean fewer warning signs were found.`;
+    : "Review seller and payment signals before you pay.";
 
   return [
     generatedSummary ?? `${listing.condition} ${listing.category_name.toLowerCase()} listing from ${listing.seller_display_name}.`,
@@ -203,6 +220,21 @@ function buildAiInsights(listing: DiscoveryDocument, aiListing: Record<string, u
     fraudInsight,
     listing.seo_tags.length ? `Relevant details: ${listing.seo_tags.slice(0, 4).join(", ")}.` : "No extra listing details are attached yet."
   ];
+}
+
+async function DemoCheckout({ listingId }: { listingId: string }) {
+  if (process.env.NODE_ENV === "production" || !isDemoMarketplaceDataEnabled()) {
+    return <p className="text-sm text-muted-foreground">Checkout is available only for a live listing.</p>;
+  }
+  const { SampleCheckoutPreview } = await import("@/components/payments/demo-checkout");
+  return (
+    <Card className="border-primary/20 bg-primary/5">
+      <CardHeader><CardTitle className="flex items-center gap-2"><LockKeyhole className="h-5 w-5 text-primary" aria-hidden="true" /> Protected checkout</CardTitle></CardHeader>
+      <CardContent>
+        <SampleCheckoutPreview listingId={listingId} />
+      </CardContent>
+    </Card>
+  );
 }
 
 function buildSafetyWarnings(listing: DiscoveryDocument, fraudScore: number | null, isLiveDatabaseListing: boolean) {
@@ -223,9 +255,24 @@ function riskTone(riskLevel: string): "success" | "warning" {
   return riskLevel === "low" ? "success" : "warning";
 }
 
-export default async function ListingDetailPage({ params }: { params: Promise<{ id: string }> }) {
+async function loadPayableOffer(offerId: string | undefined, listingId: string | undefined, buyerId: string | undefined, listingCurrency: string) {
+  if (!offerId || !listingId || !buyerId || !/^[0-9a-f-]{36}$/i.test(offerId)) return null;
+  try {
+    const admin = createAdminClient() as any;
+    const { data } = await admin.from("offers").select("id,amount,currency,status,buyer_id,listing_id,payment_due_at").eq("id", offerId).maybeSingle();
+    if (!data || data.status !== "accepted" || data.buyer_id !== buyerId || data.listing_id !== listingId) return null;
+    if (!data.payment_due_at || new Date(data.payment_due_at).getTime() <= Date.now()) return null;
+    if (normalizeCurrency(String(data.currency)) !== normalizeCurrency(listingCurrency)) return null;
+    return data as { id: string; amount: number; currency: string };
+  } catch {
+    return null;
+  }
+}
+
+export default async function ListingDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{ offer?: string }> }) {
   const { id } = await params;
-  const supabase = createClient();
+  const offerId = (await searchParams)?.offer;
+  const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   const [favoriteIds, dbListing, discoveryListing] = await Promise.all([
     user ? getFavoriteListingIds(user.id) : Promise.resolve(new Set<string>()),
@@ -237,6 +284,14 @@ export default async function ListingDetailPage({ params }: { params: Promise<{ 
   if (!listing) notFound();
 
   const isLiveDatabaseListing = Boolean(dbListing);
+  const isOwner = Boolean(user && user.id === listing.seller_id);
+  const payableOffer = await loadPayableOffer(offerId, dbListing?.id, user?.id, listing.currency);
+  const checkoutPrice = payableOffer ? Number(payableOffer.amount) : Number(listing.price_amount);
+  const checkoutQuote = quoteCheckoutAmounts({
+    priceAmount: checkoutPrice,
+    itemAmount: payableOffer ? Number(payableOffer.amount) : undefined,
+    metadata: dbListing?.metadata ?? null
+  });
   const moderationStatus = typeof dbListing?.metadata?.moderation_status === "string" ? dbListing.metadata.moderation_status : "active";
   const aiListing = recordValue(dbListing?.metadata?.ai_listing);
   const fraudScore = numberValue(aiListing?.fraudRiskScore);
@@ -249,27 +304,94 @@ export default async function ListingDetailPage({ params }: { params: Promise<{ 
   const reportHref = `/safety?report=listing&id=${encodeURIComponent(listing.id)}`;
 
   return (
-    <main className="app-container section-y">
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3 text-sm">
-        <Link href="/browse" className="inline-flex items-center gap-2 font-bold text-muted-foreground hover:text-foreground">
-          <ArrowRight className="h-4 w-4 rotate-180" aria-hidden="true" />
-          Back to marketplace
-        </Link>
-        <div className="flex flex-wrap gap-2">
-          <Badge variant="trust"><ShieldCheck className="mr-1 h-3.5 w-3.5" aria-hidden="true" /> Protected checkout eligible</Badge>
-          <Badge variant="ai"><Sparkles className="mr-1 h-3.5 w-3.5" aria-hidden="true" /> Listing signals reviewed</Badge>
-        </div>
+    <main className="app-container section-y pb-28">
+      <StripeJsScript />
+      <div className="mb-5 hidden flex-wrap gap-2 sm:flex">
+        <Badge variant="trust"><ShieldCheck className="mr-1 h-3.5 w-3.5" aria-hidden="true" /> Protected checkout eligible</Badge>
+        <Badge variant="ai"><Sparkles className="mr-1 h-3.5 w-3.5" aria-hidden="true" /> Listing signals reviewed</Badge>
       </div>
 
       <section className="grid min-w-0 max-w-full grid-cols-1 gap-6 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(19rem,24rem)] lg:items-start xl:grid-cols-[minmax(0,1fr)_26rem] xl:gap-8" aria-labelledby="listing-title">
-        <div className="min-w-0 max-w-full space-y-6">
-          <ListingGallery title={listing.title} images={images} />
+        <ListingGallery title={listing.title} images={images} />
+        <aside className="space-y-4 lg:col-start-2 lg:row-span-2 lg:row-start-1">
+          <Card className="shadow-soft">
+            <CardHeader className="space-y-4">
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="premium">{listing.condition}</Badge>
+                <Badge>{listing.category_name}</Badge>
+                <Badge variant={moderationStatus === "active" || moderationStatus === "approved" ? "trust" : "warning"}>{moderationStatus === "active" || moderationStatus === "approved" ? "Marketplace reviewed" : "Review pending"}</Badge>
+              </div>
+              <div className="space-y-3">
+                <h1 id="listing-title" data-page-title={listing.title} className="text-2xl font-black tracking-tight sm:text-4xl">{listing.title}</h1>
+                <p className="flex items-center gap-2 text-sm font-semibold text-muted-foreground">
+                  <MapPin className="h-4 w-4 text-primary" aria-hidden="true" />
+                  {listing.location_label || "Location after contact"}
+                </p>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="rounded-3xl border border-trust-border bg-trust-soft p-4">
+                <p className="text-xs font-black uppercase tracking-[0.18em] text-trust">Price</p>
+                <PriceDisplay amount={checkoutPrice} currency={listing.currency} size="lg" className="text-foreground" />
+                {payableOffer ? <p className="mt-2 text-sm font-semibold text-trust">Accepted offer price. List price was {listing.price_amount} {listing.currency}.</p> : null}
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">Use protected checkout when available. Ask for receipts or serial numbers before pickup.</p>
+              </div>
 
+              <div className="grid gap-2">
+                <FavoriteToggleForm listingId={listing.id} isFavorited={favoriteIds.has(listing.id)} variant="outline" size="lg" className="w-full" />
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <ShareListingButton title={listing.title} path={`/listings/${listing.id}`} className="w-full" />
+                <Button asChild variant="outline" className="w-full">
+                  <Link href={reportHref}><Flag className="h-4 w-4" aria-hidden="true" /> Report</Link>
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+
+          <SellerTrustCard listing={listing} fraudScore={fraudScore} />
+
+          <ListingBuyBar
+            amount={checkoutPrice}
+            currency={listing.currency}
+            label={payableOffer ? "Accepted offer" : "List price"}
+            isOwner={isOwner}
+            ownerEditHref={isOwner && isLiveDatabaseListing ? `/dashboard/listings/${listing.id}/edit` : undefined}
+            offerAction={
+              <MakeOfferSheet
+                listingId={listing.id}
+                currency={listing.currency}
+                signedOut={!user}
+                isOwner={isOwner}
+                disabled={!isLiveDatabaseListing}
+                triggerLabel="Offer"
+                variant="outline"
+                className="min-h-11"
+              />
+            }
+          >
+            {payableOffer ? null : offerId ? <p className="mb-3 text-sm text-muted-foreground">That offer cannot be paid. Checkout uses the list price only when you are the buyer on an accepted, unexpired offer in the same currency.</p> : null}
+            {isLiveDatabaseListing ? (
+              <CheckoutCard listingId={listing.id} offerId={payableOffer?.id} priceAmount={checkoutPrice} currency={listing.currency} shippingCents={checkoutQuote.shippingCents} />
+            ) : (
+              <DemoCheckout listingId={listing.id} />
+            )}
+          </ListingBuyBar>
+
+          <Card id="message-seller">
+            <CardHeader>
+              <CardTitle>Message seller</CardTitle>
+              <CardDescription>Ask about availability, condition, pickup, shipping, or offer terms.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <StartConversationCard listingId={listing.id} signedOut={!user} isOwner={Boolean(user && user.id === listing.seller_id)} editHref={user && user.id === listing.seller_id ? `/dashboard/listings/${listing.id}/edit` : undefined} disabled={!isLiveDatabaseListing} />
+            </CardContent>
+          </Card>
+        </aside>
+        <div className="min-w-0 max-w-full space-y-6 lg:col-start-1">
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <DetailMetric icon={<Store className="h-4 w-4" aria-hidden="true" />} label="Category" value={listing.category_name} />
             <DetailMetric icon={<CalendarDays className="h-4 w-4" aria-hidden="true" />} label="Published" value={formatDate(listing.published_at)} />
-            <DetailMetric icon={<Eye className="h-4 w-4" aria-hidden="true" />} label="Views" value={listing.view_count.toLocaleString()} />
-            <DetailMetric icon={<Heart className="h-4 w-4" aria-hidden="true" />} label="Saves" value={listing.saved_count.toLocaleString()} />
           </div>
 
           <Card>
@@ -287,13 +409,15 @@ export default async function ListingDetailPage({ params }: { params: Promise<{ 
 
           <div className="grid gap-4 xl:grid-cols-2">
             <AiInsightsCard insights={aiInsights} fraudScore={fraudScore} />
-            <SafetyWarningsCard warnings={safetyWarnings} />
           </div>
 
-          <div className="grid gap-4 xl:grid-cols-2">
-            <PaymentProtectionCard />
-            <SafePickupCard pickupAvailable={listing.pickup_available} shipsTo={listing.ships_to} location={listing.location_label} />
-          </div>
+          <details className="rounded-2xl border border-border bg-card p-4">
+            <summary className="cursor-pointer text-base font-bold">Safety and pickup</summary>
+            <div className="mt-4 grid gap-4">
+              <PaymentProtectionCard />
+              <SafePickupCard pickupAvailable={listing.pickup_available} shipsTo={listing.ships_to} location={listing.location_label} />
+              </div>
+          </details>
 
           {recommendations.length ? (
             <section className="space-y-5" aria-labelledby="similar-listings-title">
@@ -309,84 +433,6 @@ export default async function ListingDetailPage({ params }: { params: Promise<{ 
             </section>
           ) : null}
         </div>
-
-        <aside className="space-y-4 lg:sticky lg:top-24">
-          <Card className="shadow-soft">
-            <CardHeader className="space-y-4">
-              <div className="flex flex-wrap gap-2">
-                <Badge variant="premium">{listing.condition}</Badge>
-                <Badge>{listing.category_name}</Badge>
-                <Badge variant={moderationStatus === "active" || moderationStatus === "approved" ? "trust" : "warning"}>{moderationStatus === "active" || moderationStatus === "approved" ? "Marketplace reviewed" : "Review pending"}</Badge>
-              </div>
-              <div className="space-y-3">
-                <h1 id="listing-title" className="text-3xl font-black tracking-tight sm:text-4xl">{listing.title}</h1>
-                <p className="flex items-center gap-2 text-sm font-semibold text-muted-foreground">
-                  <MapPin className="h-4 w-4 text-primary" aria-hidden="true" />
-                  {listing.location_label || "Location after contact"}
-                </p>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-5">
-              <div className="rounded-3xl border border-trust-border bg-trust-soft p-4">
-                <p className="text-xs font-black uppercase tracking-[0.18em] text-trust">Price</p>
-                <PriceDisplay amount={listing.price_amount} currency={listing.currency} size="lg" className="text-foreground" />
-                <p className="mt-2 text-sm leading-6 text-muted-foreground">Use protected checkout when available. Ask for receipts or serial numbers before pickup.</p>
-              </div>
-
-              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
-                <Button asChild size="lg" variant="premium"><Link href="#make-offer">Make offer</Link></Button>
-                <Button asChild size="lg" variant="trust"><Link href="#protected-checkout">Buy now</Link></Button>
-                <Button asChild size="lg" variant="outline"><Link href="#message-seller"><MessageSquare className="h-4 w-4" aria-hidden="true" /> Message seller</Link></Button>
-                <FavoriteToggleForm listingId={listing.id} isFavorited={favoriteIds.has(listing.id)} variant="outline" size="lg" className="w-full" />
-              </div>
-              <div className="grid gap-2 sm:grid-cols-2">
-                <ShareListingButton title={listing.title} path={`/listings/${listing.id}`} className="w-full" />
-                <Button asChild variant="outline" className="w-full">
-                  <Link href={reportHref}><Flag className="h-4 w-4" aria-hidden="true" /> Report</Link>
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-
-          <SellerTrustCard listing={listing} fraudScore={fraudScore} />
-
-          <Card id="make-offer">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2"><WalletCards className="h-5 w-5 text-primary" aria-hidden="true" /> Offers and checkout</CardTitle>
-              <CardDescription>Start with an offer or move to protected payment when the listing supports it.</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <Button asChild variant="premium" size="lg" className="w-full">
-                <Link href="#message-seller">Make an offer through seller chat</Link>
-              </Button>
-              <p className="text-xs leading-5 text-muted-foreground">Offers stay inside marketplace messaging so the deal history is available if support is needed.</p>
-            </CardContent>
-          </Card>
-
-          <div id="protected-checkout">
-            {isLiveDatabaseListing ? (
-              <CheckoutCard listingId={listing.id} priceAmount={Number(listing.price_amount)} currency={listing.currency} />
-            ) : (
-              <Card className="border-primary/20 bg-primary/5">
-                <CardHeader><CardTitle className="flex items-center gap-2"><LockKeyhole className="h-5 w-5 text-primary" aria-hidden="true" /> Protected checkout</CardTitle></CardHeader>
-                <CardContent>
-                  <Button size="lg" disabled className="w-full">Checkout is available on live listings</Button>
-                  <p className="mt-3 text-xs leading-5 text-muted-foreground">This sample listing shows the page experience. Live listings can authorize payment before funds are captured.</p>
-                </CardContent>
-              </Card>
-            )}
-          </div>
-
-          <Card id="message-seller">
-            <CardHeader>
-              <CardTitle>Message seller</CardTitle>
-              <CardDescription>Ask about availability, condition, pickup, shipping, or offer terms.</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <StartConversationCard listingId={listing.id} disabled={!user || user.id === listing.seller_id || !isLiveDatabaseListing} />
-            </CardContent>
-          </Card>
-        </aside>
       </section>
     </main>
   );
@@ -402,7 +448,7 @@ function DetailMetric({ icon, label, value }: { icon: React.ReactNode; label: st
 }
 
 function ListingGallery({ title, images }: { title: string; images: Array<{ src: string; alt: string }> }) {
-  const mediaItems: MediaViewerItem[] = images.map((image, index) => createMediaViewerItem({
+  const mediaItems: MediaViewerItem[] = images.map((image, index) => ({
     id: `${image.src}-${index}`,
     src: image.src,
     type: "image",
@@ -411,37 +457,28 @@ function ListingGallery({ title, images }: { title: string; images: Array<{ src:
     contentType: "image/*"
   }));
   const primary = mediaItems[0];
-  const thumbnails: Array<MediaViewerItem | null> = mediaItems.slice(1, 5);
-  const thumbnailSlots: Array<MediaViewerItem | null> = thumbnails.length ? thumbnails : Array.from<MediaViewerItem | null>({ length: 4 }).fill(null);
+  const thumbnails = mediaItems.slice(1, 5);
 
   return (
     <section className="min-w-0 max-w-full overflow-hidden rounded-[1.75rem] border border-border bg-card shadow-soft sm:rounded-[2rem]" aria-label="Listing image gallery">
-      <div className="grid min-w-0 grid-cols-1 gap-3 p-2 sm:p-3 lg:grid-cols-[minmax(0,1fr)_12rem] xl:grid-cols-[minmax(0,1fr)_14rem]">
+      <div className={cn("grid min-w-0 grid-cols-1 gap-3 p-2 sm:p-3", thumbnails.length ? "lg:grid-cols-[minmax(0,1fr)_12rem] xl:grid-cols-[minmax(0,1fr)_14rem]" : "")}>
         <div className="min-w-0 overflow-hidden rounded-[1.5rem] bg-secondary">
           {primary ? (
             <MediaViewer items={mediaItems} initialIndex={0} mode="gallery" surface="listingGallery" triggerLabel={`Open ${title} media gallery`} thumbnailClassName="h-72 w-full object-cover sm:h-96 lg:h-[30rem] xl:h-[32.5rem]" />
           ) : (
-            <div className="flex h-72 w-full flex-col items-center justify-center gap-3 p-4 text-muted-foreground sm:h-96 lg:h-[30rem] xl:h-[32.5rem]">
-            <ImagePlus className="h-16 w-16 text-primary" aria-hidden="true" />
-              <p className="font-bold">Photos are not available yet</p>
-              <p className="max-w-sm text-center text-sm">Ask the seller for recent photos, serial numbers, receipts, or close-ups before making an offer.</p>
+            <div className="flex h-16 w-full items-center justify-center gap-3 px-4 text-muted-foreground">
+              <ImagePlus className="h-6 w-6 text-primary" aria-hidden="true" />
+              <p className="text-sm font-bold">Photos are not available yet</p>
             </div>
           )}
         </div>
-        <div className="grid min-w-0 grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-1">
-          {thumbnailSlots.map((image, index) => (
-            <div className="overflow-hidden rounded-2xl border border-border bg-secondary" key={image ? image.src : index}>
-              {image ? (
-                <MediaViewer items={mediaItems} initialIndex={index + 1} mode="gallery" surface="listingGallery" triggerLabel={`Open ${title} media ${index + 2}`} thumbnailClassName="h-24 w-full object-cover sm:h-28 lg:h-[7rem] xl:h-[7.55rem]" />
-              ) : (
-                <div className={cn("flex h-24 items-center justify-center text-muted-foreground sm:h-28 lg:h-[7rem] xl:h-[7.55rem]", index === 0 && primary && "bg-trust-soft")}>
-                  <PackageCheck className="h-7 w-7" aria-hidden="true" />
-                  <span className="sr-only">{title} gallery placeholder</span>
-                </div>
-              )}
+        {thumbnails.length ? <div className="grid min-w-0 grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-1">
+          {thumbnails.map((image, index) => (
+            <div className="overflow-hidden rounded-2xl border border-border bg-secondary" key={image.src}>
+              <MediaViewer items={mediaItems} initialIndex={index + 1} mode="gallery" surface="listingGallery" triggerLabel={`Open ${title} media ${index + 2}`} thumbnailClassName="h-24 w-full object-cover sm:h-28 lg:h-[7rem] xl:h-[7.55rem]" />
             </div>
           ))}
-        </div>
+        </div> : null}
       </div>
     </section>
   );
@@ -486,9 +523,6 @@ function AiInsightsCard({ insights, fraudScore }: { insights: string[]; fraudSco
             {insight}
           </p>
         ))}
-        <Badge variant={fraudScore !== null && fraudScore >= 70 ? "warning" : "trust"}>
-          {fraudScore === null ? "Public trust analysis" : `Risk score ${fraudScore}/100`}
-        </Badge>
       </CardContent>
     </Card>
   );

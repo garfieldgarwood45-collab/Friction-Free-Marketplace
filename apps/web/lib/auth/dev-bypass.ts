@@ -5,35 +5,79 @@ export const DEV_AUTH_BYPASS_USER = {
 };
 
 /**
- * Temporary open local auth.
- * When enabled, the app treats visitors as signed in without Supabase credentials.
- * Disabled in production and CI.
+ * Routes that must always use a real Supabase session.
+ * The local bypass cookie never satisfies admin, account, or order pages.
  */
-export function isDevAuthBypassEnabled() {
-  return process.env.NODE_ENV !== "production" && process.env.CI !== "true";
+export const devBypassBlockedPrefixes = [
+  "/admin",
+  "/account",
+  "/dashboard/purchases",
+  "/dashboard/sales",
+  "/dashboard/payments"
+] as const;
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+export function isLoopbackAddress(value: string | null | undefined) {
+  if (!value) return false;
+  const address = value.trim().toLowerCase().replace(/^::ffff:/, "");
+  return address === "127.0.0.1" || address === "::1" || address === "0:0:0:0:0:0:0:1";
 }
 
-/** Alias for open local sign-in mode. */
-export function isOpenLocalAuthEnabled() {
-  return isDevAuthBypassEnabled();
+export function isExactLocalRuntime() {
+  return process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test";
 }
 
-export function isDevAuthBypassCookieValue(value?: string) {
-  return isDevAuthBypassEnabled() && value === "1";
+export function isLocalDevelopmentHost(host: string | null | undefined) {
+  if (!host) return false;
+  const trimmed = host.trim().toLowerCase();
+  const hostname = trimmed.startsWith("[")
+    ? trimmed.slice(1, trimmed.indexOf("]"))
+    : trimmed.split(":")[0];
+  return LOCAL_HOSTS.has(hostname);
 }
 
 /**
- * Resolve a local development user when open auth is on.
- * Cookie is optional — open mode is enough for now.
+ * Local UI bypass. Fail closed: every condition is required, and any production
+ * signal (NODE_ENV, Vercel, CI) turns it off even if the flag is set.
+ * The caller must also prove the request Host is loopback and present the cookie.
  */
-export function getLocalAuthUser(cookieValue?: string) {
-  if (!isDevAuthBypassEnabled()) return null;
-  if (cookieValue === undefined || isDevAuthBypassCookieValue(cookieValue) || cookieValue === "1") {
-    return DEV_AUTH_BYPASS_USER;
-  }
+export function boundLoopbackPeer() {
+  const bound = process.env.FFM_BIND_HOST?.trim().toLowerCase();
+  if (bound === "127.0.0.1" || bound === "::1" || bound === "localhost") return "127.0.0.1";
+  return null;
+}
+
+export function isDevAuthBypassEnabled(host: string | null | undefined) {
+  if (process.env.ALLOW_DEV_AUTH_BYPASS !== "true") return false;
+  if (!isExactLocalRuntime()) return false;
+  if (process.env.VERCEL === "1") return false;
+  if (process.env.CI === "true") return false;
+  if (!isLocalDevelopmentHost(host)) return false;
+  const peer = boundLoopbackPeer();
+  if (!peer || !isLoopbackAddress(peer)) return false;
+  return true;
+}
+
+export function isDevBypassBlockedPath(pathname: string) {
+  return devBypassBlockedPrefixes.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+}
+
+export function isDevAuthBypassCookieValue(value: string | undefined, host: string | null | undefined) {
+  return isDevAuthBypassEnabled(host) && value === "1";
+}
+
+export function getLocalAuthUser(cookieValue?: string, host?: string | null) {
+  if (!isDevAuthBypassCookieValue(cookieValue, host ?? null)) return null;
   return DEV_AUTH_BYPASS_USER;
 }
 
-export function hasLocalAuthAccess(cookieValue?: string) {
-  return Boolean(getLocalAuthUser(cookieValue));
+/** Secure unless the configured app URL is explicitly http (local dev). Unknown URLs stay secure. */
+export function devBypassCookieSecure(appUrl: string | null | undefined) {
+  if (!appUrl) return true;
+  try {
+    return new URL(appUrl).protocol === "https:";
+  } catch {
+    return true;
+  }
 }

@@ -30,7 +30,7 @@ type ListingRow = {
 
 async function getListings() {
   try {
-    const supabase = createClient();
+    const supabase = await createClient();
     const {
       data: { user },
     } = await supabase.auth.getUser();
@@ -148,7 +148,7 @@ export default async function ListingsDashboardPage() {
                   {listing.listing_images?.[0]?.public_url ? (
                     <Image
                       src={listing.listing_images[0].public_url}
-                      alt=""
+                      alt={listing.title}
                       width={80}
                       height={80}
                       unoptimized

@@ -6,8 +6,14 @@ export function isDemoMarketplaceDataEnabled(
     NEXT_PUBLIC_SUPABASE_URL?: string;
   } = process.env,
 ) {
-  if (input.MARKETPLACE_DEMO_MODE === "true") return true;
   if (input.NODE_ENV === "production") return false;
-  return input.SUPABASE_SERVICE_ROLE_KEY === "local-dev-placeholder"
-    || Boolean(input.NEXT_PUBLIC_SUPABASE_URL?.includes("local-dev-placeholder"));
+  if (input.NODE_ENV !== "development" && input.NODE_ENV !== "test") return false;
+  return input.MARKETPLACE_DEMO_MODE === "true";
+}
+
+export function isLiveDatabaseConfigured(input: NodeJS.ProcessEnv = process.env) {
+  const url = input.NEXT_PUBLIC_SUPABASE_URL?.trim() ?? "";
+  const key = input.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? "";
+  if (!url || !key) return false;
+  return !/placeholder|example\.com/i.test(`${url} ${key}`);
 }

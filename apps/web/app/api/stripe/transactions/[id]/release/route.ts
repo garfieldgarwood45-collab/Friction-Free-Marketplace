@@ -8,6 +8,8 @@ import { recordTransactionEvent } from "@/lib/payments/audit";
 import { dollarsToCents } from "@/lib/payments/money";
 import { enqueueTemplateNotification } from "@/lib/notifications/service";
 import { buildReleaseJournal, postLedgerJournal } from "@/lib/financial/ledger";
+import { claimEscrowPayment, claimTransactionStatus, escrowActionKey } from "@/lib/payments/escrow";
+import { prepareEscrowAction } from "@/lib/payments/resume";
 import { getStripe } from "@/lib/stripe/server";
 
 const transactionIdSchema = z.string().uuid();
@@ -23,24 +25,40 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const { data: transaction } = await supabase.from("transactions").select("*").eq("id", transactionId.data).single();
   if (!transaction || ![transaction.buyer_id, transaction.seller_id].includes(auth.user.id)) return NextResponse.json({ error: "Transaction not found." }, { status: 404 });
   if (auth.user.id !== transaction.buyer_id) return NextResponse.json({ error: "Only the buyer can release held escrow funds." }, { status: 403 });
-  if (transaction.status !== "escrowed") return NextResponse.json({ error: "Transaction must be escrowed before release." }, { status: 409 });
+  if (!["escrowed", "shipped", "delivered"].includes(transaction.status)) return NextResponse.json({ error: "Transaction must be escrowed, shipped, or delivered before release." }, { status: 409 });
 
   const { data: payment } = await supabase.from("escrow_payments").select("*").eq("transaction_id", transactionId.data).single();
   const { data: sellerAccount } = await supabase.from("seller_payment_accounts").select("stripe_account_id").eq("seller_id", transaction.seller_id).single();
   if (!payment || !sellerAccount) return NextResponse.json({ error: "Payment or seller account not found." }, { status: 404 });
-  if (payment.status !== "held") return NextResponse.json({ error: "Payment must be captured and held before release." }, { status: 409 });
+  if (payment.status === "released") return NextResponse.json({ status: "completed", alreadyReleased: true });
+  if (!["held", "releasing"].includes(payment.status)) return NextResponse.json({ error: "Payment must be captured and held before release." }, { status: 409 });
   if (!payment.provider_charge_id) return NextResponse.json({ error: "Payment charge is not available for release." }, { status: 409 });
+  const { data: seller } = await supabase.from("users").select("status").eq("id", transaction.seller_id).maybeSingle();
+  if (seller && ["suspended", "banned"].includes(seller.status)) return NextResponse.json({ error: "Payout is frozen while the seller account is restricted." }, { status: 409 });
 
-  const transfer = await getStripe().transfers.create({
-    amount: dollarsToCents(Number(payment.seller_net_amount)),
-    currency: payment.currency.toLowerCase(),
-    destination: sellerAccount.stripe_account_id,
-    source_transaction: payment.provider_charge_id ?? undefined,
-    transfer_group: `transaction_${transactionId.data}`,
-    metadata: { transaction_id: transactionId.data, escrow_payment_id: payment.id }
-  }, {
-    idempotencyKey: request.headers.get("idempotency-key") ?? `release:${transactionId.data}:${payment.id}`
-  });
+  const prepared = await prepareEscrowAction(supabase, payment, "held", "releasing");
+  if (!prepared.payment || prepared.payment.status !== "releasing") {
+    if (prepared.payment?.status === "released") return NextResponse.json({ status: "completed", alreadyReleased: true });
+    return NextResponse.json({ error: "This release is already in progress." }, { status: 409 });
+  }
+
+  let transfer;
+  try {
+    transfer = await getStripe().transfers.create({
+      amount: dollarsToCents(Number(payment.seller_net_amount)),
+      currency: payment.currency.toLowerCase(),
+      destination: sellerAccount.stripe_account_id,
+      source_transaction: payment.provider_charge_id ?? undefined,
+      transfer_group: `transaction_${transactionId.data}`,
+      metadata: { transaction_id: transactionId.data, escrow_payment_id: payment.id }
+    }, {
+      idempotencyKey: escrowActionKey("release", transactionId.data, payment.id)
+    });
+  } catch (error) {
+    await claimEscrowPayment(supabase, payment.id, "releasing", "held");
+    const message = error instanceof Error ? error.message : "Stripe release failed.";
+    return NextResponse.json({ error: message }, { status: 502 });
+  }
 
   await supabase.from("payouts").insert({
     transaction_id: transactionId.data,
@@ -71,8 +89,18 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     metadata: { transfer_id: transfer.id }
   });
 
-  await supabase.from("escrow_payments").update({ status: "released", released_at: new Date().toISOString() }).eq("id", payment.id);
-  await supabase.from("transactions").update({ status: "completed", completed_at: new Date().toISOString() }).eq("id", transactionId.data);
+  const releasedPayment = await supabase.from("escrow_payments").update({ status: "released", released_at: new Date().toISOString() }).eq("id", payment.id).eq("status", "releasing").select("id");
+  if (releasedPayment.error) return NextResponse.json({ error: "Release could not be recorded." }, { status: 409 });
+  if (!releasedPayment.data?.length) {
+    const { data: current } = await supabase.from("escrow_payments").select("status").eq("id", payment.id).maybeSingle();
+    if (current?.status === "released") return NextResponse.json({ status: "completed", alreadyReleased: true });
+    return NextResponse.json({ error: "Release could not be recorded." }, { status: 409 });
+  }
+  const completed = await claimTransactionStatus(supabase, transactionId.data, transaction.status, "completed", { completed_at: new Date().toISOString() });
+  if (!completed) {
+    const { data: currentTransaction } = await supabase.from("transactions").select("status").eq("id", transactionId.data).maybeSingle();
+    if (currentTransaction?.status !== "completed") return NextResponse.json({ error: "Transaction was no longer ready for release." }, { status: 409 });
+  }
   await supabase.from("listings").update({ status: "sold", quantity: 0 }).eq("id", transaction.listing_id);
   await postLedgerJournal(supabase, buildReleaseJournal({
     transactionId: transactionId.data,

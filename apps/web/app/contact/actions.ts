@@ -1,8 +1,11 @@
 "use server";
 
+import { headers } from "next/headers";
 import { z } from "zod";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { sendMarketplaceEmail } from "@/lib/email/resend";
 import { env } from "@/lib/env.server";
+import { consumeRateLimit, RateLimitUnavailableError } from "@/lib/security/rate-limit";
 
 export type ContactActionState = {
   status: "idle" | "success" | "error";
@@ -45,7 +48,25 @@ export async function submitContactAction(_state: ContactActionState, formData: 
     return { status: "error", message: "Check the required fields and try again." };
   }
 
+  const headerStore = await headers();
+  const address = headerStore.get("x-real-ip") || headerStore.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  try {
+    const limit = await consumeRateLimit(`contact:${address}`, { limit: 5, windowMs: 10 * 60 * 1000, policy: "contact" });
+    if (!limit.allowed) {
+      return { status: "error", message: "Too many messages from this network. Please wait and try again." };
+    }
+  } catch (error) {
+    if (error instanceof RateLimitUnavailableError) {
+      return { status: "error", message: "Support is busy right now. Please use the support email shown on this page." };
+    }
+    throw error;
+  }
+
   const { name, email, topic, message } = parsed.data;
+  const saved = await (createAdminClient() as any).from("contact_messages").insert({ name, email, topic, message });
+  if (saved.error) {
+    return { status: "error", message: "The message could not be saved. Please try again." };
+  }
   try {
     await sendMarketplaceEmail({
       to: env.SUPPORT_EMAIL,
@@ -54,8 +75,8 @@ export async function submitContactAction(_state: ContactActionState, formData: 
       html: `<p><strong>From:</strong> ${escapeHtml(name)} &lt;${escapeHtml(email)}&gt;</p><p><strong>Topic:</strong> ${escapeHtml(topic)}</p><p>${escapeHtml(message).replace(/\n/g, "<br>")}</p>`,
       tags: [{ name: "category", value: "support" }]
     });
-    return { status: "success", message: "Your message was sent. Support will reply by email." };
   } catch {
-    return { status: "error", message: "Support could not receive the message right now. Please use the support email shown on this page." };
+    // The row is already saved. A mail failure does not undo the request.
   }
+  return { status: "success", message: "Your message was saved. Support will reply by email." };
 }

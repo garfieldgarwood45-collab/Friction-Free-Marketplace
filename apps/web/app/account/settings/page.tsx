@@ -1,42 +1,45 @@
 import { redirect } from "next/navigation";
-import { deleteAccountAction, logoutAction } from "@/app/auth/actions";
+import { deleteAccountAction } from "@/app/auth/actions";
+import { LogoutButton } from "@/components/auth/logout-button";
 import { AccountSettingsForm } from "@/components/forms/account-settings-form";
 import { NotificationPreferencesForm } from "@/components/notifications/notification-preferences-form";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { getLocalAuthUser } from "@/lib/auth/dev-bypass";
+import { getMarketplaceSession } from "@/lib/auth/session";
 import { getNotificationPreferences } from "@/lib/notifications/service";
 import { createClient } from "@/lib/supabase/server";
 
 export default async function AccountSettingsPage({ searchParams }: { searchParams?: Promise<{ deleteError?: string }> }) {
   const query = await searchParams;
-  const supabase = createClient();
+  const session = await getMarketplaceSession();
+  if (!session) redirect("/login?next=/account/settings");
+  if (session.source !== "supabase") {
+    return (
+      <section className="mx-auto grid max-w-4xl gap-6 px-4 py-10 sm:px-6 lg:px-8">
+        <h1 className="text-3xl font-bold tracking-tight">Account settings</h1>
+        <AccountSettingsForm email={session.email} profile={{ display_name: session.displayName, username: null, bio: null, location_label: null, website_url: null }} />
+        <p className="text-sm text-muted-foreground">{session.email}</p>
+      </section>
+    );
+  }
+  const supabase = await createClient();
   const {
     data: { user },
     error: userError
   } = await supabase.auth.getUser();
-  const localUser = getLocalAuthUser();
 
-  if ((userError || !user) && !localUser) {
+  if (userError || !user) {
     redirect("/login?next=/account/settings");
   }
 
-  const accountUser = user ?? localUser!;
-  const profile = user
-    ? (
-        await supabase
-          .from("profiles")
-          .select("display_name,username,bio,location_label,website_url")
-          .eq("user_id", user.id)
-          .maybeSingle()
-      ).data
-    : {
-        display_name: "Local developer",
-        username: "local-dev",
-        bio: "Temporary open local sign-in profile.",
-        location_label: "Local development",
-        website_url: null as string | null
-      };
+  const accountUser = user;
+  const profile = (
+    await supabase
+      .from("profiles")
+      .select("display_name,username,bio,location_label,website_url,locale")
+      .eq("user_id", user.id)
+      .maybeSingle()
+  ).data;
   const notificationPreferences = await getNotificationPreferences(accountUser.id);
 
   return (
@@ -45,9 +48,7 @@ export default async function AccountSettingsPage({ searchParams }: { searchPara
         <p className="text-sm font-semibold uppercase tracking-[0.2em] text-primary">Account</p>
         <h1 className="mt-3 text-3xl font-bold tracking-tight">Account settings</h1>
         <p className="mt-3 max-w-2xl text-muted-foreground">
-          {localUser && !user
-            ? "Open local sign-in is active. Supabase authentication is temporarily bypassed for development."
-            : "Manage your marketplace identity and public profile. Your session is verified on the server before this page loads."}
+          Manage your marketplace identity and public profile. Your session is verified on the server before this page loads.
         </p>
       </div>
       <div className="grid gap-6 lg:grid-cols-[1fr_280px]">
@@ -69,11 +70,7 @@ export default async function AccountSettingsPage({ searchParams }: { searchPara
             <CardDescription>End your active Supabase session on this device.</CardDescription>
           </CardHeader>
           <CardContent>
-            <form action={logoutAction}>
-              <Button className="w-full" variant="outline" type="submit">
-                Log out
-              </Button>
-            </form>
+            <LogoutButton className="inline-flex min-h-11 w-full items-center justify-center rounded-xl border border-border bg-card px-4 text-sm font-semibold" label="Log out" />
             <div className="mt-6 border-t border-border pt-6">
               <p className="font-semibold text-destructive">Delete account</p>
               <p className="mt-2 text-xs leading-5 text-muted-foreground">

@@ -1,8 +1,13 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 
+export function paymentAccountEligibility(user: { status: string | null } | null | undefined) {
+  if (!user || user.status !== "active") return "ineligible" as const;
+  return "active" as const;
+}
+
 export async function requireUser() {
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data, error } = await supabase.auth.getUser();
 
   if (error || !data.user) {
@@ -15,7 +20,7 @@ export async function requireUser() {
     .eq("id", data.user.id)
     .maybeSingle();
 
-  if (marketplaceUser?.status && marketplaceUser.status !== "active") {
+  if (paymentAccountEligibility(marketplaceUser) !== "active") {
     return { error: NextResponse.json({ error: "Account is not eligible for payments." }, { status: 403 }) } as const;
   }
 

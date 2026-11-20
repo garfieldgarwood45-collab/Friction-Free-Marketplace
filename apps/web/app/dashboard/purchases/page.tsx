@@ -1,8 +1,13 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { LifeBuoy, PackageCheck, RotateCcw, ShoppingBag } from "lucide-react";
 import { DashboardActionCard, DashboardListItem, DashboardShell, DashboardStatCard } from "@/components/dashboard-shell";
+import { EscrowActions } from "@/components/payments/escrow-actions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { OrderFollowUpForms } from "@/components/orders/order-actions";
+import { getMarketplaceSession } from "@/lib/auth/session";
+import { loadE2EPurchases } from "@/lib/dev/e2e-fixtures";
 import { createClient } from "@/lib/supabase/server";
 import { formatDate, formatMoney } from "@/lib/i18n/format";
 
@@ -24,17 +29,27 @@ function money(amount: number, currency: string) {
 }
 
 function purchaseMilestone(transaction: TransactionRow) {
-  if (transaction.status === "pending_payment") return "Payment authorization is still pending.";
-  if (transaction.status === "paid") return "Payment is authorized. Waiting for seller capture or fulfillment.";
-  if (transaction.status === "escrowed") return "Funds are held while seller fulfills the item.";
-  if (transaction.status === "completed") return `Completed ${formatDate(transaction.completed_at ?? transaction.updated_at)}.`;
-  if (transaction.status === "disputed") return "Dispute is open. Keep all evidence in the marketplace.";
-  if (transaction.status === "refunded") return "Refund has been recorded on this purchase.";
+  if (transaction.status === "pending_payment") return "Payment is still being confirmed.";
+  if (transaction.status === "paid") return "You paid. The seller can now accept the order.";
+  if (transaction.status === "escrowed") return "Your payment is held until you confirm you got the item.";
+  if (transaction.status === "shipped") return "The seller marked this as shipped. Confirm when it arrives.";
+  if (transaction.status === "delivered") return "The item was marked received. Release payment if everything looks right.";
+  if (transaction.status === "completed") return "This order is done. Payment has been released.";
+  if (transaction.status === "cancelled") return "This order was cancelled.";
+  if (transaction.status === "disputed") return "A problem was reported. Keep all evidence in the marketplace.";
+  if (transaction.status === "refunded") return "This payment was refunded.";
   return `Last updated ${formatDate(transaction.updated_at)}.`;
 }
 
+const purchaseSteps = [
+  { label: "Paid", statuses: ["pending_payment", "paid", "escrowed"] },
+  { label: "Shipped", statuses: ["shipped"] },
+  { label: "Received", statuses: ["delivered"] },
+  { label: "Done", statuses: ["completed"] }
+];
+
 async function getBuyerPurchases(userId: string) {
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data } = await (supabase as any)
     .from("transactions")
     .select("id,listing_id,status,total_amount,currency,created_at,updated_at,paid_at,delivered_at,completed_at")
@@ -51,9 +66,9 @@ async function getBuyerPurchases(userId: string) {
 }
 
 export default async function PurchasesPage() {
-  const supabase = createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  const purchases = user ? await getBuyerPurchases(user.id) : [];
+  const session = await getMarketplaceSession();
+  if (!session) redirect("/login?next=/dashboard/purchases");
+  const purchases = session.source === "supabase" ? await getBuyerPurchases(session.id) : session.source === "e2e" ? await loadE2EPurchases(session.id) : [];
   const active = purchases.filter((purchase) => !["completed", "cancelled", "refunded"].includes(purchase.status));
   const completed = purchases.filter((purchase) => purchase.status === "completed");
   const support = purchases.filter((purchase) => ["disputed", "refunded"].includes(purchase.status));
@@ -70,7 +85,16 @@ export default async function PurchasesPage() {
         <CardContent className="grid gap-3">
           {purchases.length ? purchases.map((purchase) => (
             <DashboardListItem key={purchase.id} title={purchase.title} detail={`${money(purchase.total_amount, purchase.currency)} · ${purchaseMilestone(purchase)}`} status={purchase.status}>
+              <ol className="grid gap-1 text-xs" aria-label="Order status">
+                {purchaseSteps.map((step) => {
+                  const current = step.statuses.includes(purchase.status);
+                  return (
+                    <li key={step.label} className={current ? "font-bold text-[#0c3f66]" : "text-muted-foreground"} aria-current={current ? "step" : undefined}>{step.label}</li>
+                  );
+                })}
+              </ol>
               <Button asChild size="sm" variant="outline"><Link href={`/listings/${purchase.listing_id}`}>View listing</Link></Button>
+              <EscrowActions transactionId={purchase.id} role="buyer" status={purchase.status} amount={Number(purchase.total_amount)} currency={purchase.currency} />
             </DashboardListItem>
           )) : (
             <div className="rounded-2xl border border-dashed border-border bg-secondary/50 p-5 text-sm text-muted-foreground">
@@ -79,6 +103,7 @@ export default async function PurchasesPage() {
           )}
         </CardContent>
       </Card>
+      <OrderFollowUpForms orders={purchases.map((purchase) => ({ id: purchase.id, title: purchase.title, status: purchase.status, amount: Number(purchase.total_amount), currency: purchase.currency }))} />
       <DashboardActionCard icon={LifeBuoy} title="Buyer protection" description="Open support cases, request returns, report unsafe meetup behavior, and keep every protected payment event in one ledger.">
         <Button asChild variant="outline"><Link href="/contact">Contact support</Link></Button>
       </DashboardActionCard>

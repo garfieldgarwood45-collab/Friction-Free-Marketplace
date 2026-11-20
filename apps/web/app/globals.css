@@ -26,21 +26,21 @@
     --popover: 0 0% 100%;
     --popover-foreground: 220 28% 8%;
 
-    --commerce: 209 86% 48%;
+    --commerce: 209 78% 32%;
     --commerce-foreground: 0 0% 100%;
     --commerce-soft: 209 100% 96%;
     --commerce-border: 209 55% 78%;
     --commerce-dark: 215 42% 18%;
 
-    --primary: 209 86% 48%;
+    --primary: 209 78% 32%;
     --primary-foreground: 0 0% 100%;
 
-    --trust: 209 86% 48%;
+    --trust: 209 72% 26%;
     --trust-foreground: 0 0% 100%;
     --trust-soft: 209 100% 96%;
     --trust-border: 209 55% 78%;
 
-    --ai: 205 78% 44%;
+    --ai: 205 72% 28%;
     --ai-foreground: 0 0% 100%;
     --ai-soft: 205 90% 95%;
     --ai-border: 205 48% 74%;
@@ -71,10 +71,10 @@
     --secondary: 210 35% 94%;
     --secondary-foreground: 220 28% 8%;
     --muted: 210 35% 94%;
-    --muted-foreground: 215 12% 42%;
+    --muted-foreground: 215 18% 27%;
     --accent: 209 100% 96%;
     --accent-foreground: 215 42% 22%;
-    --destructive: 0 84% 60%;
+    --destructive: 0 72% 38%;
     --destructive-foreground: 0 0% 100%;
     --border: 214 22% 88%;
     --input: 214 20% 84%;
@@ -377,6 +377,15 @@
     @apply border-trust bg-trust text-trust-foreground shadow-trust hover:bg-commerce-dark hover:shadow-card-hover;
   }
 
+  .ui-button-primary,
+  .ui-button-trust,
+  a.ui-button-trust,
+  button.ui-button-trust {
+    background-color: #0e4b7a !important;
+    border-color: #0e4b7a !important;
+    color: #ffffff !important;
+  }
+
   .ui-button-surface {
     @apply border-border bg-card text-foreground shadow-control hover:border-brand-steel hover:bg-secondary hover:shadow-md;
   }
@@ -528,8 +537,17 @@
   }
 
   .dashboard-hero {
-    @apply overflow-hidden rounded-shell border border-white/10 bg-premium-dark p-4 text-white shadow-admin sm:p-6;
+    @apply overflow-hidden rounded-shell border border-border bg-card p-4 text-foreground shadow-sm sm:p-6;
     position: relative;
+  }
+
+  .dashboard-compact .dashboard-banner,
+  .dashboard-compact .dashboard-hero {
+    display: none;
+  }
+
+  .dashboard-compact .dashboard-lead {
+    display: none;
   }
 
   .dashboard-grid {
@@ -578,6 +596,26 @@
 
   .status-premium {
     @apply border-premium-border bg-premium-soft text-premium-foreground;
+  }
+
+  .app-backdrop {
+    background: #d7e0ea;
+  }
+
+  .app-shell .grid:not(.keep-grid) {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .app-shell .listing-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  html.keyboard-open .app-tabs {
+    display: none;
+  }
+
+  .app-shell :is(button, a, summary):active {
+    transform: scale(0.98);
   }
 
   .app-container {
@@ -798,4 +836,27 @@
 @keyframes page-arrive {
   from { opacity: 0; transform: translateY(0.75rem); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+html:not(.dark) {
+  --muted-foreground: 215 28% 18%;
+}
+
+html:not(.dark) .text-primary {
+  color: #0c3f66;
+}
+
+html:not(.dark) .status-trust {
+  color: #0c3f66 !important;
+  background-color: #e7f1f8 !important;
+}
+
+html:not(.dark) .ui-button-primary,
+html:not(.dark) .ui-button-trust,
+html:not(.dark) a.ui-button-trust,
+html:not(.dark) button.ui-button-trust,
+html:not(.dark) .bg-primary {
+  background-color: #0c3f66 !important;
+  border-color: #0c3f66 !important;
+  color: #ffffff !important;
 }

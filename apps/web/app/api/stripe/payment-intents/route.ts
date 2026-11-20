@@ -5,7 +5,9 @@ import { z } from "zod";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { requireUser } from "@/lib/payments/auth";
 import { recordTransactionEvent } from "@/lib/payments/audit";
-import { calculatePlatformFeeCents, centsToDollars, dollarsToCents, normalizeCurrency } from "@/lib/payments/money";
+import { centsToDollars, normalizeCurrency } from "@/lib/payments/money";
+import { openCheckoutStatuses } from "@/lib/payments/open-checkout";
+import { clientChargesMatchQuote, quoteCheckoutAmounts } from "@/lib/payments/quote";
 import { checkoutStripeIdempotencyKey, parseIdempotencyKey } from "@/lib/payments/idempotency";
 import { enqueueTemplateNotification } from "@/lib/notifications/service";
 import { getStripe } from "@/lib/stripe/server";
@@ -13,8 +15,9 @@ import { isTrustedMutationOrigin } from "@/lib/security/request-origin";
 
 const paymentIntentRequestSchema = z.object({
   listingId: z.string().uuid(),
-  shippingCents: z.number().int().min(0).max(25_000_00).default(0),
-  taxCents: z.number().int().min(0).max(25_000_00).default(0)
+  offerId: z.string().uuid().optional(),
+  shippingCents: z.number().int().min(0).max(25_000_00).optional(),
+  taxCents: z.number().int().min(0).max(25_000_00).optional()
 });
 
 export async function POST(request: Request) {
@@ -35,7 +38,7 @@ export async function POST(request: Request) {
   const supabase = createAdminClient() as any;
   const { data: listing, error: listingError } = await supabase
     .from("listings")
-    .select("id,title,seller_id,price_amount,currency,status,quantity")
+    .select("id,title,seller_id,price_amount,currency,status,quantity,metadata")
     .eq("id", payload.data.listingId)
     .is("deleted_at", null)
     .single();
@@ -58,17 +61,66 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: "Seller has not completed Stripe Connect onboarding." }, { status: 409 });
   }
 
-  const itemCents = dollarsToCents(Number(listing.price_amount));
-  const platformFeeCents = calculatePlatformFeeCents(itemCents + payload.data.shippingCents + payload.data.taxCents);
-  const totalCents = itemCents + payload.data.shippingCents + payload.data.taxCents + platformFeeCents;
+  let offer: { id: string; amount: number; currency: string } | null = null;
+  if (payload.data.offerId) {
+    const { data: acceptedOffer, error: offerError } = await supabase
+      .from("offers")
+      .select("id,amount,currency,status,buyer_id,listing_id,payment_due_at")
+      .eq("id", payload.data.offerId)
+      .maybeSingle();
+    if (offerError) return NextResponse.json({ error: "Could not load the accepted offer." }, { status: 500 });
+    const paymentDue = acceptedOffer?.payment_due_at && new Date(acceptedOffer.payment_due_at).getTime() <= Date.now();
+    const currencyMismatch = acceptedOffer && normalizeCurrency(acceptedOffer.currency) !== normalizeCurrency(listing.currency);
+    if (!acceptedOffer || acceptedOffer.status !== "accepted" || acceptedOffer.buyer_id !== auth.user.id || acceptedOffer.listing_id !== listing.id || paymentDue || !acceptedOffer.payment_due_at) {
+      return NextResponse.json({ error: "That accepted offer cannot be paid." }, { status: 409 });
+    }
+    if (currencyMismatch) return NextResponse.json({ error: "Offer currency does not match the listing." }, { status: 409 });
+    const { data: usedOffer, error: usedOfferError } = await supabase
+      .from("transactions")
+      .select("id,idempotency_key")
+      .eq("offer_id", acceptedOffer.id)
+      .in("status", [...openCheckoutStatuses])
+      .maybeSingle();
+    if (usedOfferError) return NextResponse.json({ error: "Could not check the accepted offer." }, { status: 500 });
+    if (usedOffer && usedOffer.idempotency_key !== idempotencyKey) {
+      return NextResponse.json({ error: "offer already used for checkout" }, { status: 409 });
+    }
+    offer = acceptedOffer;
+  }
+
+  const quote = quoteCheckoutAmounts({
+    priceAmount: Number(listing.price_amount),
+    itemAmount: offer ? Number(offer.amount) : undefined,
+    metadata: listing.metadata
+  });
+  if (!clientChargesMatchQuote(quote, payload.data)) {
+    return NextResponse.json({
+      error: "Shipping or tax does not match the server quote.",
+      shippingCents: quote.shippingCents,
+      taxCents: quote.taxCents
+    }, { status: 400 });
+  }
+  const platformFeeCents = quote.platformFeeCents;
+  const totalCents = quote.totalCents;
   const currency = normalizeCurrency(listing.currency);
 
   const expectedAmounts = {
-    item: centsToDollars(itemCents),
-    shipping: centsToDollars(payload.data.shippingCents),
-    tax: centsToDollars(payload.data.taxCents),
-    fee: centsToDollars(platformFeeCents),
+    item: quote.itemAmount,
+    shipping: quote.shippingAmount,
+    tax: quote.taxAmount,
+    fee: quote.platformFeeAmount,
   };
+  const { data: openSale, error: openSaleError } = await supabase
+    .from("transactions")
+    .select("id,buyer_id,idempotency_key")
+    .eq("listing_id", listing.id)
+    .in("status", [...openCheckoutStatuses])
+    .limit(1)
+    .maybeSingle();
+  if (openSaleError) return NextResponse.json({ error: "Could not check listing availability." }, { status: 500 });
+  if (openSale && openSale.idempotency_key !== idempotencyKey) {
+    return NextResponse.json({ error: "This listing already has an open checkout." }, { status: 409 });
+  }
   let { data: transaction } = await supabase
     .from("transactions")
     .select("*")
@@ -117,23 +169,38 @@ export async function POST(request: Request) {
       shipping_amount: expectedAmounts.shipping,
       tax_amount: expectedAmounts.tax,
       marketplace_fee_amount: expectedAmounts.fee,
-      currency: currency.toUpperCase(),
+      currency: String(offer?.currency ?? currency).toUpperCase(),
+      offer_id: offer?.id ?? null,
       idempotency_key: idempotencyKey,
       metadata: {
-        checkout_kind: "full_purchase",
+        checkout_kind: offer ? "accepted_offer" : "full_purchase",
+        offer_id: offer?.id ?? null,
+        offer_currency: offer?.currency ?? null,
         seller_stripe_account_id: sellerAccount.stripe_account_id
       }
     }).select("*").single();
     transaction = inserted.data;
 
     if (inserted.error?.code === "23505") {
-      const raced = await supabase
-        .from("transactions")
-        .select("*")
-        .eq("buyer_id", auth.user.id)
-        .eq("idempotency_key", idempotencyKey)
-        .maybeSingle();
-      transaction = raced.data;
+      if (offer) {
+        const byOffer = await supabase.from("transactions").select("*").eq("offer_id", offer.id).in("status", [...openCheckoutStatuses]).maybeSingle();
+        if (byOffer.data && byOffer.data.idempotency_key !== idempotencyKey) {
+          return NextResponse.json({ error: "offer already used for checkout" }, { status: 409 });
+        }
+        transaction = byOffer.data;
+      }
+      if (!transaction) {
+        const raced = await supabase
+          .from("transactions")
+          .select("*")
+          .eq("buyer_id", auth.user.id)
+          .eq("idempotency_key", idempotencyKey)
+          .maybeSingle();
+        if (!raced.data) {
+          return NextResponse.json({ error: "This listing already has an open checkout." }, { status: 409 });
+        }
+        transaction = raced.data;
+      }
     }
     if (!transaction) return NextResponse.json({ error: "Could not create transaction." }, { status: 500 });
   }

@@ -1,14 +1,14 @@
 "use server";
 
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { DEV_AUTH_BYPASS_COOKIE, isOpenLocalAuthEnabled } from "@/lib/auth/dev-bypass";
+import { DEV_AUTH_BYPASS_COOKIE, devBypassCookieSecure, isDevAuthBypassEnabled } from "@/lib/auth/dev-bypass";
 import { publicEnv } from "@/lib/env";
-import { authSchema, profileSettingsSchema, signupSchema } from "@/lib/validations/auth";
+import { authSchema, memberDisplayName, profileSettingsSchema, signupSchema } from "@/lib/validations/auth";
 
 export type AuthActionState = {
   status: "idle" | "error" | "success";
@@ -36,13 +36,19 @@ function formatValidationError(error: z.ZodError) {
 }
 
 async function establishLocalAuthSession(next: string): Promise<never> {
+  const headerStore = await headers();
+  const host = headerStore.get("host");
+  if (!isDevAuthBypassEnabled(host)) {
+    redirect(`/login?next=${encodeURIComponent(next)}&authError=${encodeURIComponent("Developer bypass is not available in this environment.")}`);
+  }
+
   const cookieStore = await cookies();
   cookieStore.set(DEV_AUTH_BYPASS_COOKIE, "1", {
     httpOnly: true,
     sameSite: "lax",
-    secure: false,
+    secure: devBypassCookieSecure(process.env.NEXT_PUBLIC_APP_URL),
     path: "/",
-    maxAge: 60 * 60 * 24 * 30
+    maxAge: 60 * 60 * 12
   });
   revalidatePath("/", "layout");
   redirect(next);
@@ -50,11 +56,6 @@ async function establishLocalAuthSession(next: string): Promise<never> {
 
 export async function loginAction(_previousState: AuthActionState, formData: FormData): Promise<AuthActionState> {
   const next = getSafeRedirectPath(formData.get("next"));
-
-  // Temporary open local auth: accept any login attempt without Supabase.
-  if (isOpenLocalAuthEnabled()) {
-    await establishLocalAuthSession(next);
-  }
 
   const parsed = authSchema.safeParse({
     email: getFormString(formData, "email"),
@@ -65,7 +66,7 @@ export async function loginAction(_previousState: AuthActionState, formData: For
     return { status: "error", message: formatValidationError(parsed.error) };
   }
 
-  const supabase = createClient();
+  const supabase = await createClient();
   const { error } = await supabase.auth.signInWithPassword(parsed.data);
 
   if (error) {
@@ -79,11 +80,6 @@ export async function loginAction(_previousState: AuthActionState, formData: For
 export async function signupAction(_previousState: AuthActionState, formData: FormData): Promise<AuthActionState> {
   const next = getSafeRedirectPath(formData.get("next"));
 
-  // Temporary open local auth: accept any signup attempt without Supabase.
-  if (isOpenLocalAuthEnabled()) {
-    await establishLocalAuthSession(next);
-  }
-
   const parsed = signupSchema.safeParse({
     displayName: getFormString(formData, "displayName"),
     email: getFormString(formData, "email"),
@@ -94,7 +90,7 @@ export async function signupAction(_previousState: AuthActionState, formData: Fo
     return { status: "error", message: formatValidationError(parsed.error) };
   }
 
-  const supabase = createClient();
+  const supabase = await createClient();
   const redirectTo = new URL(`/auth/callback?next=${encodeURIComponent(next)}`, publicEnv.NEXT_PUBLIC_APP_URL).toString();
   const { data, error } = await supabase.auth.signUp({
     email: parsed.data.email,
@@ -102,7 +98,7 @@ export async function signupAction(_previousState: AuthActionState, formData: Fo
     options: {
       emailRedirectTo: redirectTo,
       data: {
-        display_name: parsed.data.displayName,
+        display_name: parsed.data.displayName || "Member",
         full_name: parsed.data.displayName
       }
     }
@@ -117,14 +113,15 @@ export async function signupAction(_previousState: AuthActionState, formData: Fo
       {
         id: data.user.id,
         email: data.user.email ?? parsed.data.email,
-        status: "active",
+        role: "buyer",
+        status: "pending",
         metadata: { signup_source: "web" }
       },
       { ignoreDuplicates: true }
     );
     await supabase.from("profiles").upsert({
       user_id: data.user.id,
-      display_name: parsed.data.displayName
+      display_name: parsed.data.displayName || (data.user ? memberDisplayName(data.user.id) : "Member")
     });
 
     revalidatePath("/", "layout");
@@ -145,7 +142,7 @@ export async function oauthSignInAction(formData: FormData) {
     redirect(`/login?next=${encodeURIComponent(next)}&authError=${encodeURIComponent("Unsupported sign-on provider.")}`);
   }
 
-  const supabase = createClient();
+  const supabase = await createClient();
   const redirectTo = new URL(`/auth/callback?next=${encodeURIComponent(next)}`, publicEnv.NEXT_PUBLIC_APP_URL).toString();
   const { data, error } = await supabase.auth.signInWithOAuth({
     provider: provider.data,
@@ -161,16 +158,11 @@ export async function oauthSignInAction(formData: FormData) {
 
 export async function devBypassAction(formData: FormData) {
   const next = getSafeRedirectPath(formData.get("next"));
-
-  if (!isOpenLocalAuthEnabled()) {
-    redirect(`/login?next=${encodeURIComponent(next)}&authError=${encodeURIComponent("Developer bypass is not available in this environment.")}`);
-  }
-
   await establishLocalAuthSession(next);
 }
 
 export async function logoutAction() {
-  const supabase = createClient();
+  const supabase = await createClient();
   await supabase.auth.signOut();
   const cookieStore = await cookies();
   cookieStore.delete(DEV_AUTH_BYPASS_COOKIE);
@@ -191,7 +183,7 @@ export async function updateAccountAction(_previousState: AuthActionState, formD
     return { status: "error", message: formatValidationError(parsed.error) };
   }
 
-  const supabase = createClient();
+  const supabase = await createClient();
   const {
     data: { user },
     error: userError
@@ -229,7 +221,7 @@ export async function deleteAccountAction(formData: FormData) {
     redirect("/account/settings?deleteError=Type%20DELETE%20to%20confirm");
   }
 
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) redirect("/login?next=/account/settings");
 
@@ -247,4 +239,50 @@ export async function deleteAccountAction(formData: FormData) {
   cookieStore.delete(DEV_AUTH_BYPASS_COOKIE);
   if (error) redirect("/login?accountDeletionPending=1");
   redirect("/?accountDeleted=1");
+}
+
+export async function requestPasswordResetAction(_previousState: AuthActionState, formData: FormData): Promise<AuthActionState> {
+  const email = getFormString(formData, "email").trim();
+  const parsed = z.string().trim().email("Enter a valid email address.").safeParse(email);
+  if (!parsed.success) {
+    return { status: "error", message: parsed.error.issues[0]?.message ?? "Enter a valid email address." };
+  }
+
+  const supabase = await createClient();
+  const redirectTo = new URL("/auth/callback?next=/auth/update-password", publicEnv.NEXT_PUBLIC_APP_URL).toString();
+  const { error } = await supabase.auth.resetPasswordForEmail(parsed.data, { redirectTo });
+  if (error) {
+    return { status: "error", message: error.message };
+  }
+
+  return {
+    status: "success",
+    message: "If an account exists for that email, we sent a link to reset your password."
+  };
+}
+
+export async function updatePasswordAction(_previousState: AuthActionState, formData: FormData): Promise<AuthActionState> {
+  const parsed = z.object({
+    password: z.string().min(8, "Password must be at least 8 characters."),
+    confirmPassword: z.string().min(8, "Password must be at least 8 characters.")
+  }).safeParse({
+    password: getFormString(formData, "password"),
+    confirmPassword: getFormString(formData, "confirmPassword")
+  });
+
+  if (!parsed.success) {
+    return { status: "error", message: formatValidationError(parsed.error) };
+  }
+  if (parsed.data.password !== parsed.data.confirmPassword) {
+    return { status: "error", message: "Passwords do not match." };
+  }
+
+  const supabase = await createClient();
+  const { error } = await supabase.auth.updateUser({ password: parsed.data.password });
+  if (error) {
+    return { status: "error", message: error.message };
+  }
+
+  revalidatePath("/", "layout");
+  redirect("/login?next=/dashboard");
 }

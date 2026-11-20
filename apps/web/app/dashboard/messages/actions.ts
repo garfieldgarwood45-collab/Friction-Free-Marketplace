@@ -17,7 +17,7 @@ const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "application/pdf", "text/plain", "video/mp4"]);
 
 async function requireUser() {
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data: { user }, error } = await supabase.auth.getUser();
   if (error || !user) throw new Error("Sign in to use marketplace messaging.");
   return { supabase, user };
@@ -26,8 +26,8 @@ async function requireUser() {
 
 export async function getConversationSummaryAction(input: unknown) {
   const payload = z.object({ conversationId: uuidSchema }).parse(input);
-  const { supabase } = await requireUser();
-  return getConversationSummaryById(supabase, payload.conversationId);
+  const { supabase, user } = await requireUser();
+  return getConversationSummaryById(supabase, payload.conversationId, user.id);
 }
 
 export async function createConversationAction(input: unknown) {
@@ -338,27 +338,6 @@ export async function schedulePickupAction(input: unknown) {
   }).select("*").single();
   if (error) throw error;
   await (supabase as any).from("messages").insert({ conversation_id: conversation.id, sender_id: user.id, body: `Pickup proposed for ${new Date(payload.startsAt).toLocaleString()}.`, kind: "pickup_schedule", metadata: { pickup_schedule_id: data.id } });
-  revalidatePath("/dashboard/messages");
-  return data;
-}
-
-export async function createReservationDepositAction(input: unknown) {
-  const payload = z.object({ conversationId: uuidSchema, offerId: uuidSchema.optional(), amount: z.coerce.number().positive(), currency: z.string().length(3).default("USD"), dueAt: z.string().datetime().optional().or(z.literal("")) }).parse(input);
-  const { supabase, user } = await requireUser();
-  const conversation = await assertCanUseConversation(supabase as any, payload.conversationId, user.id, { requireOpen: true });
-  const { data, error } = await (supabase as any).from("reservation_deposits").insert({
-    conversation_id: conversation.id,
-    listing_id: conversation.listing_id,
-    offer_id: payload.offerId,
-    buyer_id: conversation.buyer_id,
-    seller_id: conversation.seller_id,
-    amount: payload.amount,
-    currency: payload.currency.toUpperCase(),
-    due_at: payload.dueAt || null,
-    metadata: { requested_by_id: user.id }
-  }).select("*").single();
-  if (error) throw error;
-  await (supabase as any).from("messages").insert({ conversation_id: conversation.id, sender_id: user.id, body: `Reservation deposit requested: ${data.currency} ${data.amount}.`, kind: "deposit", metadata: { deposit_id: data.id } });
   revalidatePath("/dashboard/messages");
   return data;
 }

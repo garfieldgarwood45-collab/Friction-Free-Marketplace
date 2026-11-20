@@ -1,19 +1,51 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { DEV_AUTH_BYPASS_COOKIE } from "@/lib/auth/dev-bypass";
+
+vi.mock("@supabase/ssr", () => ({
+  createServerClient: () => ({
+    auth: {
+      getUser: async () => {
+        const response = await fetch("https://example-project.supabase.co/auth/v1/user", {
+          headers: { apikey: "test-anon-key" }
+        });
+        if (!response.ok) return { data: { user: null }, error: new Error("auth failed") };
+        const user = await response.json() as { id?: string };
+        return { data: { user: user?.id ? user : null }, error: user?.id ? null : new Error("auth failed") };
+      }
+    },
+    from: () => ({
+      select: () => ({
+        eq: () => ({
+          maybeSingle: async () => ({ data: { role: "buyer", status: "active" }, error: null })
+        })
+      })
+    })
+  })
+}));
+
 import { config, getSafeRedirectPath, isAuthRoute, isProtectedRoute, proxy } from "../../proxy";
 
 const supabaseUrl = "https://example-project.supabase.co";
 const anonKey = "test-anon-key";
 
-function createRequest(pathname: string, cookie?: string, init?: { method?: string; origin?: string }) {
+function createRequest(pathname: string, cookie?: string, init?: { method?: string; origin?: string; host?: string }) {
   return new NextRequest(new URL(pathname, "https://marketplace.example"), {
     method: init?.method,
     headers: {
       ...(cookie ? { cookie } : {}),
       ...(init?.origin ? { origin: init.origin } : {}),
+      ...(init?.host ? { host: init.host } : { host: "marketplace.example" }),
     }
   });
+}
+
+function enableLocalBypass() {
+  vi.stubEnv("NODE_ENV", "development");
+  vi.stubEnv("CI", "");
+  vi.stubEnv("VERCEL", "");
+  vi.stubEnv("ALLOW_DEV_AUTH_BYPASS", "true");
+  vi.stubEnv("FFM_BIND_HOST", "127.0.0.1");
 }
 
 function createSupabaseAuthCookie(accessToken: string) {
@@ -25,6 +57,9 @@ describe("middleware route helpers", () => {
   it("identifies protected and auth routes", () => {
     expect(isProtectedRoute("/dashboard")).toBe(true);
     expect(isProtectedRoute("/dashboard/listings")).toBe(true);
+    expect(isProtectedRoute("/seller")).toBe(true);
+    expect(isProtectedRoute("/assistant")).toBe(true);
+    expect(isProtectedRoute("/sellers/verified-road-bike")).toBe(false);
     expect(isProtectedRoute("/browse")).toBe(false);
     expect(isAuthRoute("/login")).toBe(true);
     expect(isAuthRoute("/signup")).toBe(true);
@@ -74,6 +109,9 @@ describe("middleware", () => {
   });
 
   it("allows same-origin browser mutations and signed server routes", async () => {
+    vi.stubEnv("NEXT_PUBLIC_APP_URL", "https://marketplace.example");
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("VERCEL", "1");
     const browserResponse = await proxy(createRequest("/api/offers", undefined, {
       method: "POST",
       origin: "https://marketplace.example",
@@ -92,8 +130,49 @@ describe("middleware", () => {
 
     const response = await proxy(createRequest("/dashboard", `sb-example-project-auth-token=base64-${encodedNullSession}`));
 
-    expect(fetchMock).not.toHaveBeenCalled();
     expect(response.headers.get("location")).toBe("https://marketplace.example/login?next=%2Fdashboard");
+  });
+
+  it("sends a local e2e buyer from admin and from login back to the dashboard", async () => {
+    enableLocalBypass();
+    vi.stubEnv("FFM_E2E_AUTH", "true");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const admin = await proxy(createRequest("/admin", "ffm-e2e-user=alice", { host: "127.0.0.1:3001" }));
+    const login = await proxy(createRequest("/login?next=/admin", "ffm-e2e-user=alice", { host: "127.0.0.1:3001" }));
+
+    expect(admin.headers.get("location")).toBe("https://marketplace.example/dashboard?adminDenied=1");
+    expect(login.headers.get("location")).toBe("https://marketplace.example/dashboard?adminDenied=1");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends a dev-bypass session that asks for admin back to the dashboard", async () => {
+    enableLocalBypass();
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", supabaseUrl);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", anonKey);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await proxy(createRequest("/login?next=/admin", `${DEV_AUTH_BYPASS_COOKIE}=1`, { host: "127.0.0.1:3001" }));
+
+    expect(response.headers.get("location")).toBe("https://marketplace.example/dashboard?adminDenied=1");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends a signed-in non-admin from admin to the dashboard", async () => {
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", supabaseUrl);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", anonKey);
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (String(url).includes("/auth/v1/user")) return new Response(JSON.stringify({ id: "user-1" }), { status: 200 });
+      return new Response(JSON.stringify([{ role: "buyer", status: "active" }]), { status: 200 });
+    }));
+
+    const response = await proxy(createRequest("/admin"));
+    const login = await proxy(createRequest("/login?next=/admin"));
+
+    expect(response.headers.get("location")).toBe("https://marketplace.example/dashboard?adminDenied=1");
+    expect(login.headers.get("location")).toBe("https://marketplace.example/dashboard?adminDenied=1");
   });
 
   it("redirects protected routes to login when auth lookup fails", async () => {
@@ -110,42 +189,77 @@ describe("middleware", () => {
     expect(response.headers.get("location")).toBe("https://marketplace.example/login?next=%2Fdashboard%3Ftab%3Dlistings");
   });
 
-  it("allows development bypass cookies through dashboard routes", async () => {
-    vi.stubEnv("NODE_ENV", "development");
-    vi.stubEnv("CI", "false");
+  it("allows a strict localhost bypass cookie through dashboard routes", async () => {
+    enableLocalBypass();
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", supabaseUrl);
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", anonKey);
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await proxy(createRequest("/dashboard/listings/create", `${DEV_AUTH_BYPASS_COOKIE}=1`));
+    const response = await proxy(createRequest("/dashboard/listings/create", `${DEV_AUTH_BYPASS_COOKIE}=1`, { host: "localhost:3001" }));
 
     expect(response.headers.get("location")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not allow development bypass cookies into admin routes", async () => {
-    vi.stubEnv("NODE_ENV", "development");
-    vi.stubEnv("CI", "false");
+  it("does not treat the bypass flag as a session without the cookie or on a public host", async () => {
+    enableLocalBypass();
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", supabaseUrl);
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", anonKey);
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
 
-    const response = await proxy(createRequest("/admin/users", `${DEV_AUTH_BYPASS_COOKIE}=1`));
+    const missingCookie = await proxy(createRequest("/dashboard", undefined, { host: "localhost:3001" }));
+    const publicHost = await proxy(createRequest("/dashboard", `${DEV_AUTH_BYPASS_COOKIE}=1`, { host: "marketplace.example" }));
 
-    expect(response.headers.get("location")).toBe("https://marketplace.example/login?next=%2Fadmin%2Fusers");
+    expect(missingCookie.headers.get("location")).toBe("https://marketplace.example/login?next=%2Fdashboard");
+    expect(publicHost.headers.get("location")).toBe("https://marketplace.example/login?next=%2Fdashboard");
   });
 
-  it("redirects auth routes when development bypass is active", async () => {
-    vi.stubEnv("NODE_ENV", "development");
-    vi.stubEnv("CI", "false");
+  it("keeps admin, account, and order routes on real auth when the bypass cookie is present", async () => {
+    enableLocalBypass();
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", supabaseUrl);
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", anonKey);
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await proxy(createRequest("/login?next=/dashboard/listings/create", `${DEV_AUTH_BYPASS_COOKIE}=1`));
+    for (const path of ["/admin/users", "/account/settings", "/dashboard/purchases", "/dashboard/sales", "/dashboard/payments"]) {
+      const response = await proxy(createRequest(path, `${DEV_AUTH_BYPASS_COOKIE}=1`, { host: "localhost:3001" }));
+      expect(response.headers.get("location")).toBe(`https://marketplace.example/login?next=${encodeURIComponent(path)}`);
+    }
+  });
+
+  it("does not activate the bypass in production, on Vercel, or without the explicit flag", async () => {
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", supabaseUrl);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", anonKey);
+    const cookie = `${DEV_AUTH_BYPASS_COOKIE}=1`;
+    const host = { host: "localhost:3001" };
+
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("VERCEL", "");
+    vi.stubEnv("CI", "");
+    vi.stubEnv("ALLOW_DEV_AUTH_BYPASS", "true");
+    const production = await proxy(createRequest("/dashboard", cookie, host));
+
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("VERCEL", "1");
+    const vercel = await proxy(createRequest("/dashboard", cookie, host));
+
+    vi.stubEnv("VERCEL", "");
+    vi.stubEnv("ALLOW_DEV_AUTH_BYPASS", "");
+    const missingFlag = await proxy(createRequest("/dashboard", cookie, host));
+
+    expect(production.headers.get("location")).toBe("https://marketplace.example/login?next=%2Fdashboard");
+    expect(vercel.headers.get("location")).toBe("https://marketplace.example/login?next=%2Fdashboard");
+    expect(missingFlag.headers.get("location")).toBe("https://marketplace.example/login?next=%2Fdashboard");
+  });
+
+  it("redirects auth routes only when the strict bypass cookie is present", async () => {
+    enableLocalBypass();
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", supabaseUrl);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", anonKey);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await proxy(createRequest("/login?next=/dashboard/listings/create", `${DEV_AUTH_BYPASS_COOKIE}=1`, { host: "127.0.0.1:3001" }));
 
     expect(response.headers.get("location")).toBe("https://marketplace.example/dashboard/listings/create");
     expect(fetchMock).not.toHaveBeenCalled();

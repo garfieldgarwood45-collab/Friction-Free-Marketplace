@@ -1,9 +1,9 @@
 import { createAdminClient } from "@/lib/supabase/admin";
-import { listings as demoListings } from "@/lib/marketplace-data";
+import { loadDemoListings } from "@/lib/dev/load-demo-catalog";
 import { rowToDiscoveryDocument, searchMarketplace, type DiscoveryResult } from "@/lib/search/discovery";
 import type { DiscoveryDocument } from "@/lib/search/schema";
 import { recordReliabilityEvent } from "@/lib/observability/reliability";
-import { isDemoMarketplaceDataEnabled } from "@/lib/marketplace/demo-mode";
+import { isDemoMarketplaceDataEnabled, isLiveDatabaseConfigured } from "@/lib/marketplace/demo-mode";
 
 type Row = Record<string, unknown>;
 
@@ -60,7 +60,8 @@ function recordPublicDataFailure(operation: string) {
   });
 }
 
-function demoCategoryRows(): PublicCategory[] {
+async function demoCategoryRows(): Promise<PublicCategory[]> {
+  const demoListings = await loadDemoListings();
   const counts = new Map<string, number>();
   for (const listing of demoListings) {
     const slug = listing.category.toLowerCase().replace(/\s+/g, "-");
@@ -82,7 +83,13 @@ export async function getFeaturedListings(limit = 6): Promise<DiscoveryResult> {
 
 export async function getPublicListingParams(limit = 50): Promise<Array<{ id: string }>> {
   if (isDemoMarketplaceDataEnabled()) {
+    const demoListings = await loadDemoListings();
     return demoListings.slice(0, limit).map((listing) => ({ id: listing.id }));
+  }
+
+  if (!isLiveDatabaseConfigured()) {
+    recordPublicDataFailure("getPublicListingParams");
+    return [];
   }
 
   try {
@@ -110,6 +117,7 @@ export async function getPublicListingParams(limit = 50): Promise<Array<{ id: st
 
 export async function getPublicSellerParams(limit = 50): Promise<Array<{ id: string }>> {
   if (isDemoMarketplaceDataEnabled()) {
+    const demoListings = await loadDemoListings();
     const seen = new Set<string>();
     return demoListings.flatMap((listing, index) => {
       const id = `demo-seller-${index}`;
@@ -117,6 +125,11 @@ export async function getPublicSellerParams(limit = 50): Promise<Array<{ id: str
       seen.add(id);
       return [{ id }];
     }).slice(0, limit);
+  }
+
+  if (!isLiveDatabaseConfigured()) {
+    recordPublicDataFailure("getPublicSellerParams");
+    return [];
   }
 
   try {
@@ -151,7 +164,12 @@ export async function getPublicSellerParams(limit = 50): Promise<Array<{ id: str
 
 export async function getPublicCategories(limit = 8): Promise<{ categories: PublicCategory[]; source: "database" | "demo" | "unavailable" }> {
   if (isDemoMarketplaceDataEnabled()) {
-    return { categories: demoCategoryRows().slice(0, limit), source: "demo" };
+    return { categories: (await demoCategoryRows()).slice(0, limit), source: "demo" };
+  }
+
+  if (!isLiveDatabaseConfigured()) {
+    recordPublicDataFailure("getPublicCategories");
+    return { categories: [], source: "unavailable" };
   }
 
   try {
@@ -185,13 +203,10 @@ export async function getCategoryPage(slug: string) {
     getPublicCategories(20),
     searchMarketplace({ category: slug, sort: "recommended", limit: 18 })
   ]);
-  const category = categories.find((item) => item.slug === slug) ?? {
-    id: slug,
-    slug,
-    name: slug.split("-").map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" "),
-    description: "Trusted listings in this marketplace category.",
-    listingCount: listings.total
-  };
+  const category = categories.find((item) => item.slug === slug);
+  if (!category) {
+    return { category: null, listings, categories, source };
+  }
 
   return { category: { ...category, listingCount: listings.total || category.listingCount }, listings, categories, source };
 }
@@ -200,6 +215,11 @@ export async function getListingById(id: string): Promise<DiscoveryDocument | nu
   if (isDemoMarketplaceDataEnabled()) {
     const result = await searchMarketplace({ limit: 200 });
     return result.listings.find((listing) => listing.id === id) ?? null;
+  }
+
+  if (!isLiveDatabaseConfigured()) {
+    recordPublicDataFailure("getListingById");
+    return null;
   }
 
   try {
@@ -244,10 +264,15 @@ export async function getSellerProfile(id: string): Promise<{ seller: SellerProf
     };
   }
 
+  if (!isLiveDatabaseConfigured()) {
+    recordPublicDataFailure("getSellerProfile");
+    return { seller: null, listings: [] };
+  }
+
   try {
     const supabase = createAdminClient();
     const [{ data: profile, error: profileError }, { data: trust, error: trustError }, { data: listingRows, error: listingsError }] = await Promise.all([
-      (supabase as any).from("profiles").select("user_id, display_name, username, bio, avatar_url, banner_url, location_label, seller_headline, response_time_minutes").eq("user_id", id).maybeSingle(),
+      (supabase as any).from("public_profiles").select("user_id, display_name, username, bio, avatar_url, banner_url, location_label, seller_headline, response_time_minutes").eq("user_id", id).maybeSingle(),
       (supabase as any).from("trust_scores").select("score, seller_score, completed_transactions, review_count, fraud_risk_level").eq("user_id", id).maybeSingle(),
       (supabase as any).from("listing_search_documents").select("*").eq("seller_id", id).eq("status", "active").order("published_at", { ascending: false }).limit(12)
     ]);
@@ -286,7 +311,12 @@ export async function getSellerProfile(id: string): Promise<{ seller: SellerProf
 
 export async function getTrustSafetyStats(): Promise<TrustSafetyStats> {
   if (isDemoMarketplaceDataEnabled()) {
-    return { source: "demo", activeListings: demoListings.length, trustedSellers: 3, completedTransactions: 86, lowRiskRate: 98 };
+    return { source: "demo", activeListings: (await loadDemoListings()).length, trustedSellers: 0, completedTransactions: 0, lowRiskRate: 0 };
+  }
+
+  if (!isLiveDatabaseConfigured()) {
+    recordPublicDataFailure("getTrustSafetyStats");
+    return { source: "unavailable", activeListings: 0, trustedSellers: 0, completedTransactions: 0, lowRiskRate: 0 };
   }
 
   try {

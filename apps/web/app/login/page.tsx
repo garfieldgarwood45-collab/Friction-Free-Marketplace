@@ -1,8 +1,10 @@
 import Link from "next/link";
+import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { AuthForm } from "@/components/forms/auth-form";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { isOpenLocalAuthEnabled } from "@/lib/auth/dev-bypass";
+import { getDevBypassSession } from "@/lib/auth/dev-bypass-session";
+import { e2eUserFromCookie } from "@/lib/auth/e2e-session";
 import { createClient } from "@/lib/supabase/server";
 
 function getSafeNext(next?: string | string[]) {
@@ -13,18 +15,28 @@ function getSafeNext(next?: string | string[]) {
 export default async function LoginPage({ searchParams }: { searchParams?: Promise<{ next?: string | string[]; loggedOut?: string; authError?: string; accountDeletionPending?: string }> }) {
   const resolvedSearchParams = await searchParams;
   const next = getSafeNext(resolvedSearchParams?.next);
+  const devBypass = await getDevBypassSession();
 
-  // Temporary open local auth: send people straight into the app.
-  if (isOpenLocalAuthEnabled()) {
-    redirect(next);
+  if (devBypass.user) {
+    redirect(next.startsWith("/admin") ? "/dashboard?adminDenied=1" : next);
   }
 
-  const supabase = createClient();
+  const e2eUser = e2eUserFromCookie((await cookies()).get("ffm-e2e-user")?.value, (await headers()).get("host"));
+  if (e2eUser) {
+    redirect(next.startsWith("/admin") ? "/dashboard?adminDenied=1" : next);
+  }
+
+  const supabase = await createClient();
   const {
     data: { user }
   } = await supabase.auth.getUser();
 
   if (user) {
+    if (next === "/admin" || next.startsWith("/admin/")) {
+      const { data: account } = await supabase.from("users").select("role,status").eq("id", user.id).maybeSingle();
+      const isAdmin = account?.status === "active" && (account.role === "admin" || account.role === "super_admin");
+      redirect(isAdmin ? next : "/dashboard?adminDenied=1");
+    }
     redirect(next);
   }
 
@@ -32,7 +44,7 @@ export default async function LoginPage({ searchParams }: { searchParams?: Promi
     <section className="mx-auto grid min-h-[70vh] max-w-6xl place-items-center px-4 py-12 sm:px-6 lg:px-8">
       <Card className="w-full max-w-md shadow-soft">
         <CardHeader>
-          <CardTitle className="text-2xl">Log in</CardTitle>
+          <CardTitle className="text-2xl">Log in to your account</CardTitle>
           <CardDescription>Access your buyer, seller, or admin workspace.</CardDescription>
         </CardHeader>
         <CardContent>
@@ -51,7 +63,7 @@ export default async function LoginPage({ searchParams }: { searchParams?: Promi
               Your marketplace data was anonymized and this session was closed. Contact support to finish removing the authentication record.
             </p>
           ) : null}
-          <AuthForm mode="login" next={next} showDevBypass={false} />
+          <AuthForm mode="login" next={next} showDevBypass={devBypass.enabled} />
           <p className="mt-5 text-center text-sm text-muted-foreground">
             New here? <Link className="font-semibold text-primary" href={`/signup?next=${encodeURIComponent(next)}`}>Create an account</Link>
           </p>

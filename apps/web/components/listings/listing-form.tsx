@@ -31,7 +31,7 @@ import {
   LISTING_STATUSES,
   type AiListingResponse,
 } from "@/lib/listings/validation";
-import { createClient as createBrowserClient } from "@/lib/supabase/browser";
+import { cn } from "@/lib/utils";
 
 const MAX_IMAGES = 12;
 const FULFILLMENT_OPTIONS = ["shipping", "pickup", "local_delivery"] as const;
@@ -283,6 +283,15 @@ function getReadinessItems(values: FormState) {
   ];
 }
 
+
+function firstStepWithError(errors: Partial<Record<string, unknown>>) {
+  if (errors.images) return 0;
+  if (errors.title || errors.description || errors.category || errors.condition) return 1;
+  if (errors.priceAmount || errors.currency || errors.quantity) return 2;
+  if (errors.locationCity || errors.locationRegion || errors.locationCountry || errors.fulfillmentOptions) return 3;
+  return 4;
+}
+
 function statusConfirmation(status: ListingStatus) {
   if (status === "active") return "Publish this listing? Buyers will be able to find it, save it, and start conversations.";
   if (status === "sold") return "Mark this listing as sold? Buyers will no longer treat it as available.";
@@ -301,6 +310,7 @@ export function ListingForm({
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [sellerNotes, setSellerNotes] = useState("");
+  const [sellStep, setSellStep] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -367,19 +377,18 @@ export function ListingForm({
     });
   }
 
+
   async function uploadPhotos(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
     if (!files.length) return;
     setBusy("Uploading photos");
     setError(null);
-    const authorization = await fetch("/api/uploads/sign", {
+    const body = new FormData();
+    body.set("existingCount", String(images.length));
+    for (const file of files) body.append("files", file);
+    const authorization = await fetch("/api/uploads/listing", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        purpose: "listing",
-        existingCount: images.length,
-        files: files.map((file) => ({ name: file.name, type: file.type, size: file.size }))
-      })
+      body
     });
     const payload = await authorization.json();
     if (!authorization.ok) {
@@ -387,17 +396,12 @@ export function ListingForm({
       setError(typeof payload.error === "string" ? payload.error : "Unable to authorize photo uploads.");
       return;
     }
-    const storage = createBrowserClient().storage.from(payload.bucket);
-    const uploaded: UploadedImage[] = [];
-    for (const [index, upload] of payload.uploads.entries()) {
-      const { error: uploadError } = await storage.uploadToSignedUrl(upload.path, upload.token, files[index], { contentType: files[index].type });
-      if (uploadError) {
-        setBusy(null);
-        setError(uploadError.message);
-        return;
-      }
-      uploaded.push({ storagePath: upload.path, publicUrl: upload.publicUrl, altText: files[index].name.replace(/\.[^.]+$/, ""), sortOrder: upload.sortOrder });
-    }
+    const uploaded: UploadedImage[] = (payload.uploads ?? []).map((upload: { path: string; publicUrl?: string; sortOrder: number }, index: number) => ({
+      storagePath: upload.path,
+      publicUrl: upload.publicUrl,
+      altText: files[index]?.name.replace(/\.[^.]+$/, "") || "",
+      sortOrder: upload.sortOrder
+    }));
     setBusy(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
     updateImages([...images, ...uploaded].slice(0, MAX_IMAGES));
@@ -554,6 +558,9 @@ export function ListingForm({
         router.push("/dashboard/listings");
         router.refresh();
       });
+    }, (formErrors) => {
+      setSellStep(firstStepWithError(formErrors));
+      setError("Check the highlighted fields, then try again.");
     })();
   }
 
@@ -608,7 +615,24 @@ export function ListingForm({
       }}
     >
       <div className="space-y-6">
-        <Card>
+        <div className="grid grid-cols-5 gap-1" aria-label="Listing steps">
+          {["Photos", "Details", "Price", "Fulfillment", "Review"].map((label, index) => {
+            const stepHasError = firstStepWithError(errors) === index && Object.keys(errors).length > 0;
+            return (
+            <button key={label} type="button" className={cn("min-h-11 rounded-xl px-1 text-xs font-bold", sellStep === index ? "bg-[#0c3f66] text-white" : stepHasError ? "bg-destructive/15 text-destructive" : "bg-secondary text-foreground")} aria-current={sellStep === index ? "step" : undefined} onClick={() => setSellStep(index)}>{label}{stepHasError ? " !" : ""}</button>
+            );
+          })}
+        </div>
+        <div className="sticky bottom-[calc(4.5rem+env(safe-area-inset-bottom))] z-20 flex gap-2 rounded-2xl border border-border bg-background/95 p-2 shadow-md backdrop-blur">
+          <Button type="button" variant="outline" className="flex-1" disabled={sellStep === 0} onClick={() => setSellStep((step) => Math.max(0, step - 1))}>Back</Button>
+          {sellStep < 4 ? (
+            <Button type="button" className="flex-1" onClick={() => setSellStep((step) => Math.min(4, step + 1))}>Next</Button>
+          ) : (
+            <Button type="button" className="flex-1" disabled={disabled} onClick={() => submitListing(true)}>Publish listing</Button>
+          )}
+        </div>
+        {error ? <p className="text-sm text-destructive" role="alert">{error}</p> : null}
+        <Card className={sellStep === 1 || sellStep === 2 ? "" : "hidden"}>
           <CardHeader className="p-4 sm:p-6">
             <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
               <div>
@@ -684,7 +708,7 @@ export function ListingForm({
                 {helperText(errors.condition?.message)}
               </div>
             </div>
-            <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-3">
+            <div className={cn("grid gap-4 sm:grid-cols-2 2xl:grid-cols-3", sellStep === 2 ? "" : "hidden")}>
               <div className="grid gap-2">
                 <Label htmlFor="priceAmount">Price</Label>
                 <Input
@@ -696,12 +720,12 @@ export function ListingForm({
                 />
                 {priceSuggestion && (
                   <p className="text-xs text-muted-foreground">
-                    AI range: {priceSuggestion}
+                    AI range: {null}
                   </p>
                 )}
                 {helperText(errors.priceAmount?.message)}
               </div>
-              <div className="grid gap-2">
+              <div className="hidden">
                 <Label htmlFor="currency">Currency</Label>
                 <Input
                   id="currency"
@@ -715,7 +739,7 @@ export function ListingForm({
                 />
                 {helperText(errors.currency?.message)}
               </div>
-              <div className="grid gap-2">
+              <div className="hidden">
                 <Label htmlFor="quantity">Quantity</Label>
                 <Input
                   id="quantity"
@@ -729,7 +753,7 @@ export function ListingForm({
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className={sellStep === 0 ? "" : "hidden"}>
           <CardHeader>
             <CardTitle>Photos and AI generation</CardTitle>
           </CardHeader>
@@ -856,7 +880,7 @@ export function ListingForm({
               </div>
             )}
             {helperText(errors.images?.message)}
-            <div className="grid gap-2">
+            <div className="hidden">
               <Label htmlFor="sellerNotes">Optional AI notes</Label>
               <Textarea
                 id="sellerNotes"
@@ -879,7 +903,7 @@ export function ListingForm({
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className={sellStep === 3 ? "" : "hidden"}>
           <CardHeader>
             <CardTitle>Location and fulfillment</CardTitle>
           </CardHeader>
@@ -895,7 +919,7 @@ export function ListingForm({
                 <Input id="locationRegion" {...register("locationRegion")} />
                 {helperText(errors.locationRegion?.message)}
               </div>
-              <div className="grid gap-2">
+              <div className="hidden">
                 <Label htmlFor="locationCountry">Country</Label>
                 <Input
                   id="locationCountry"
@@ -931,7 +955,7 @@ export function ListingForm({
               </div>
               {helperText(errors.fulfillmentOptions?.message)}
             </div>
-            <div className="grid gap-2">
+            <div className="hidden">
               <Label htmlFor="shipsTo">Ships to</Label>
               <Input
                 id="shipsTo"
@@ -944,7 +968,7 @@ export function ListingForm({
         </Card>
       </div>
 
-      <aside className="space-y-5 xl:sticky xl:top-24 xl:h-fit">
+      <aside className={sellStep === 4 ? "space-y-5" : "hidden"}>
         <Card className={isReadyToPublish ? "border-primary/30 bg-primary/5" : undefined}>
           <CardHeader>
             <CardTitle>Publish readiness</CardTitle>
@@ -1040,123 +1064,6 @@ export function ListingForm({
                     Archive listing
                   </Button>
                 ) : null}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>Publishing guidance and SEO</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4 p-4 pt-0 sm:p-6 sm:pt-0">
-            <div className="grid gap-2">
-              <Label htmlFor="seoTags">SEO tags</Label>
-              <Input
-                id="seoTags"
-                placeholder="camera, creator kit, mirrorless"
-                {...register("seoTags")}
-              />
-              {helperText(errors.seoTags?.message)}
-            </div>
-            {watched.ai?.generated && (
-              <div className="space-y-3 rounded-2xl bg-secondary p-4 text-sm">
-                <p className="font-semibold">AI analysis</p>
-                <p className="text-muted-foreground">
-                  Scam risk score: {watched.ai.fraudRiskScore ?? "n/a"}/100
-                </p>
-                {watched.ai.scamRiskWarning && (
-                  <p className="rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-destructive">
-                    {watched.ai.scamRiskWarning}
-                  </p>
-                )}
-                {watched.ai.conditionConfidence !== undefined && (
-                  <p className="text-muted-foreground">
-                    Condition confidence:{" "}
-                    {Math.round(watched.ai.conditionConfidence * 100)}%
-                  </p>
-                )}
-                {generationTrace && (
-                  <div className="rounded-xl border border-border bg-background p-3 text-xs text-muted-foreground">
-                    <p className="font-medium text-foreground">Usage logging</p>
-                    <p>Task: {generationTrace.taskId ?? "audit event only"}</p>
-                    <p>Latency: {generationTrace.latencyMs.toLocaleString()}ms</p>
-                    {generationTrace.totalTokens !== undefined && (
-                      <p>Tokens: {generationTrace.totalTokens.toLocaleString()}</p>
-                    )}
-                    {generationTrace.model && <p>Model: {generationTrace.model}</p>}
-                  </div>
-                )}
-                {watched.ai.categoryRationale && (
-                  <p className="text-muted-foreground">
-                    Category rationale: {watched.ai.categoryRationale}
-                  </p>
-                )}
-                {watched.ai.priceRationale && (
-                  <p className="text-muted-foreground">
-                    Price rationale: {watched.ai.priceRationale}
-                  </p>
-                )}
-                {watched.ai.conditionEvidence &&
-                  watched.ai.conditionEvidence.length > 0 && (
-                    <div>
-                      <p className="font-medium">Condition evidence</p>
-                      <ul className="mt-1 list-disc space-y-1 pl-5 text-muted-foreground">
-                        {watched.ai.conditionEvidence.map((evidence) => (
-                          <li key={evidence}>{evidence}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                {watched.ai.riskFactors &&
-                  watched.ai.riskFactors.length > 0 && (
-                    <div>
-                      <p className="font-medium">Risk factors</p>
-                      <ul className="mt-1 list-disc space-y-1 pl-5 text-muted-foreground">
-                        {watched.ai.riskFactors.map((factor) => (
-                          <li key={factor}>{factor}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                {watched.ai.fraudIndicators?.indicators?.length ? (
-                  <div>
-                    <p className="font-medium">
-                      Fraud indicators: {watched.ai.fraudIndicators.riskLevel} risk
-                      {watched.ai.fraudIndicators.reviewRequired ? " · review required" : ""}
-                    </p>
-                    <ul className="mt-1 space-y-2 text-muted-foreground">
-                      {watched.ai.fraudIndicators.indicators.map((indicator) => (
-                        <li key={`${indicator.type}-${indicator.evidence}`} className="rounded-xl border border-border bg-background p-3">
-                          <span className="font-medium text-foreground">
-                            {indicator.severity} {indicator.type}
-                          </span>
-                          <span className="block">{indicator.evidence}</span>
-                          <span className="block text-xs">{indicator.recommendation}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-                {watched.ai.missingInformationQuestions &&
-                  watched.ai.missingInformationQuestions.length > 0 && (
-                    <div>
-                      <p className="font-medium">
-                        Missing information to answer
-                      </p>
-                      <ul className="mt-1 list-disc space-y-1 pl-5 text-muted-foreground">
-                        {watched.ai.missingInformationQuestions.map(
-                          (question) => (
-                            <li key={question}>{question}</li>
-                          ),
-                        )}
-                      </ul>
-                    </div>
-                  )}
-                {watched.ai.rationale && (
-                  <p className="text-muted-foreground">
-                    {watched.ai.rationale}
-                  </p>
-                )}
               </div>
             )}
           </CardContent>

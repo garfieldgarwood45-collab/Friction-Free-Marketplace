@@ -10,17 +10,21 @@ describe("marketplace demo-data policy", () => {
     })).toBe(false);
   });
 
-  it("requires an explicit production override", () => {
+  it("ignores the demo flag in production and unknown environments", () => {
     expect(isDemoMarketplaceDataEnabled({
       NODE_ENV: "production",
       MARKETPLACE_DEMO_MODE: "true",
-    })).toBe(true);
+    })).toBe(false);
+    expect(isDemoMarketplaceDataEnabled({
+      NODE_ENV: "staging",
+      MARKETPLACE_DEMO_MODE: "true",
+    })).toBe(false);
   });
 
-  it("keeps placeholder-backed local development useful", () => {
+  it("does not invent inventory when the database is not configured", () => {
     expect(isDemoMarketplaceDataEnabled({
       NODE_ENV: "development",
       SUPABASE_SERVICE_ROLE_KEY: "local-dev-placeholder",
-    })).toBe(true);
+    })).toBe(false);
   });
 });

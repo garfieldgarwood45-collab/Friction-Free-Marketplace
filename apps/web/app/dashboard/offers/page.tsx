@@ -37,7 +37,7 @@ export default async function OffersPage() {
   let setupError: string | null = null;
 
   try {
-    const supabase = createClient();
+    const supabase = await createClient();
     const { data: { user } } = await supabase.auth.getUser();
     if (user) {
       userId = user.id;
@@ -113,9 +113,11 @@ export default async function OffersPage() {
                   status={offer.status}
                   expiresAt={offer.expires_at ? new Date(offer.expires_at).toLocaleString() : undefined}
                   actions={
-                    <div className="flex flex-wrap items-center justify-end gap-2">
+                    <div className="grid gap-2">
                       {awaitingYou ? <Badge variant="warning">Awaiting you</Badge> : <Badge>{displayOfferStatus(offer.status)}</Badge>}
                       {latestHistory && <Badge className="gap-1"><History className="h-3 w-3" />{latestHistory.from_status ? displayOfferStatus(latestHistory.from_status) : "new"} -&gt; {displayOfferStatus(latestHistory.to_status)}</Badge>}
+                      {offer.expires_at && offer.status === "pending" ? <p className="text-xs font-semibold">Response deadline {new Date(offer.expires_at).toLocaleString()}</p> : null}
+                      {offer.status === "accepted" && offer.buyer_id === userId ? <Button asChild className="min-h-11 w-full" variant="trust"><Link href={`/listings/${offer.listing_id}?offer=${offer.id}#protected-checkout`}>Pay accepted offer</Link></Button> : null}
                       {offer.conversation_id && <Button asChild size="sm"><Link href={`/dashboard/messages?conversation=${offer.conversation_id}`}>Review</Link></Button>}
                     </div>
                   }

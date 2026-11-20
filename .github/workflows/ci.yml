@@ -18,7 +18,7 @@ jobs:
           version: latest
       - name: Validate canonical migrations from an empty database
         run: |
-          supabase start -x studio,imgproxy,inbucket,edge-runtime,logflare,vector,supavisor
+          supabase start -x studio,imgproxy,local_smtp,edge-runtime,logflare,vector,supavisor
           supabase db reset
       - name: Stop local Supabase
         if: always()
@@ -68,6 +68,11 @@ jobs:
           push: false
           tags: friction-free-marketplace:ci
           load: true
+          build-args: |
+            NEXT_PUBLIC_APP_URL=http://127.0.0.1:3000
+            NEXT_PUBLIC_SUPABASE_URL=https://ci.supabase.co
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=ci-placeholder
+            NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_test_ci_placeholder
       - name: Container health smoke test
         run: |
           docker run -d --name marketplace -p 3000:3000 \

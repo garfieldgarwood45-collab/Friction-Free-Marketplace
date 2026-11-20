@@ -2,6 +2,7 @@ import { MessageSquare, ShieldCheck, Zap } from "lucide-react";
 import { DashboardShell } from "@/components/dashboard-shell";
 import { CommunicationHub } from "@/components/messaging/communication-hub";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { getMarketplaceSession } from "@/lib/auth/session";
 import { createClient } from "@/lib/supabase/server";
 import { getConversationSummaries } from "@/lib/messaging/queries";
 import type { ConversationSummary } from "@/lib/messaging/types";
@@ -13,11 +14,13 @@ export default async function MessagesPage({ searchParams }: { searchParams?: Pr
   let setupError: string | null = null;
 
   try {
-    const supabase = createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      userId = user.id;
-      conversations = await getConversationSummaries(supabase, user.id);
+    const session = await getMarketplaceSession();
+    if (session?.source === "e2e") {
+      userId = session.id;
+    } else if (session?.source === "supabase") {
+      const supabase = await createClient();
+      userId = session.id;
+      conversations = await getConversationSummaries(supabase, session.id);
     }
   } catch (error) {
     setupError = error instanceof Error ? error.message : "Messages could not be loaded right now.";
@@ -25,7 +28,7 @@ export default async function MessagesPage({ searchParams }: { searchParams?: Pr
 
   return (
     <DashboardShell title="Messages" description="Buyer and seller conversations with offers, pickup details, deposits, and safety tools in one place.">
-      <div className="mb-6 grid gap-4 md:grid-cols-3">
+      <div className="dashboard-lead mb-6 grid gap-4 md:grid-cols-3">
         <Card>
           <CardHeader className="pb-2"><CardTitle className="flex items-center gap-2 text-base"><Zap className="h-4 w-4 text-primary" />Live messages</CardTitle></CardHeader>
           <CardContent className="text-sm text-muted-foreground">See messages, attachments, offer updates, typing indicators, and read receipts as they arrive.</CardContent>

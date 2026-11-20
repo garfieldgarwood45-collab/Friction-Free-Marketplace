@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { redirect } from "next/navigation";
-import { DEV_AUTH_BYPASS_USER, isOpenLocalAuthEnabled } from "@/lib/auth/dev-bypass";
 import { createClient } from "@/lib/supabase/server";
 import type { Database } from "@/types/database";
 
@@ -61,8 +60,8 @@ export const permissionLabels: Record<AdminPermission, string> = {
 type UserRow = Database["public"]["Tables"]["users"]["Row"];
 type AdminAuthorizationSuccess = {
   authorized: true;
-  supabase: ReturnType<typeof createClient>;
-  authUser: NonNullable<Awaited<ReturnType<ReturnType<typeof createClient>["auth"]["getUser"]>>["data"]["user"]>;
+  supabase: Awaited<ReturnType<typeof createClient>>;
+  authUser: NonNullable<Awaited<ReturnType<Awaited<ReturnType<typeof createClient>>["auth"]["getUser"]>>["data"]["user"]>;
   adminUser: Pick<UserRow, "id" | "email" | "role" | "status" | "metadata">;
   role: AdminRole;
 };
@@ -73,13 +72,40 @@ type AdminAuthorizationFailure = {
   permission: AdminPermission;
 };
 
+const limitedStaffRoles = new Set<AdminRole>(["support", "moderator", "risk", "finance", "analyst"]);
+
+function narrowedStaffRole(metadata: UserRow["metadata"]): AdminRole | null {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
+  const requested = (metadata as { admin_role?: unknown }).admin_role;
+  return typeof requested === "string" && limitedStaffRoles.has(requested as AdminRole) ? requested as AdminRole : null;
+}
+
 export function getAdminRole(user: Pick<UserRow, "role" | "metadata"> | null | undefined): AdminRole | null {
   if (!user || (user.role !== "admin" && user.role !== "super_admin")) return null;
   if (user.role === "super_admin") return "super_admin";
-  const metadata = user.metadata as Record<string, unknown> | null;
-  const configuredRole = metadata?.admin_role;
-  if (typeof configuredRole === "string" && configuredRole in rolePermissions) return configuredRole as AdminRole;
-  return "admin";
+  return narrowedStaffRole(user.metadata) ?? "admin";
+}
+
+const adminRank: Record<string, number> = {
+  support: 1,
+  analyst: 1,
+  moderator: 2,
+  finance: 2,
+  risk: 3,
+  admin: 4,
+  super_admin: 5
+};
+
+export function adminRankFor(user: { role?: string | null; metadata?: unknown } | null | undefined) {
+  const resolved = getAdminRole(user as Pick<UserRow, "role" | "metadata"> | null);
+  return resolved ? adminRank[resolved] ?? 0 : 0;
+}
+
+export function canRestrictUser(actor: { id: string; role?: string | null; metadata?: unknown }, target: { id: string; role?: string | null; metadata?: unknown }) {
+  if (!actor.id || actor.id === target.id) return false;
+  const role = getAdminRole(actor as Pick<UserRow, "role" | "metadata">);
+  if (!can(role, "users.ban")) return false;
+  return adminRankFor(actor) > adminRankFor(target);
 }
 
 export function can(role: AdminRole | null, permission: AdminPermission) {
@@ -87,39 +113,8 @@ export function can(role: AdminRole | null, permission: AdminPermission) {
 }
 
 export async function getAdminAuthorization(permission: AdminPermission = "admin.access"): Promise<AdminAuthorizationSuccess | AdminAuthorizationFailure> {
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data: authData, error: authError } = await supabase.auth.getUser();
-
-  // Temporary open local auth: grant super_admin so admin surfaces are inspectable without Supabase.
-  if ((authError || !authData.user) && isOpenLocalAuthEnabled()) {
-    const role: AdminRole = "super_admin";
-    if (!can(role, permission)) {
-      return { authorized: false, status: 403, message: "Admin permission denied.", permission };
-    }
-
-    const adminUser = {
-      id: DEV_AUTH_BYPASS_USER.id,
-      email: DEV_AUTH_BYPASS_USER.email,
-      role: "super_admin" as const,
-      status: "active" as const,
-      metadata: { admin_role: "super_admin", open_local_auth: true }
-    };
-
-    return {
-      authorized: true,
-      supabase,
-      authUser: {
-        id: DEV_AUTH_BYPASS_USER.id,
-        email: DEV_AUTH_BYPASS_USER.email,
-        app_metadata: {},
-        user_metadata: { open_local_auth: true },
-        aud: "authenticated",
-        created_at: new Date(0).toISOString()
-      } as AdminAuthorizationSuccess["authUser"],
-      adminUser,
-      role
-    };
-  }
 
   if (authError || !authData.user) {
     return { authorized: false, status: 401, message: "Authentication required.", permission };

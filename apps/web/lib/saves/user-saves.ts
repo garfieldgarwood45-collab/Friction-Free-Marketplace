@@ -1,4 +1,5 @@
 import { createClient } from "@/lib/supabase/server";
+import { isDemoMarketplaceDataEnabled } from "@/lib/marketplace/demo-mode";
 import { searchMarketplace } from "@/lib/search/discovery";
 import type { DiscoveryDocument } from "@/lib/search/schema";
 
@@ -91,7 +92,7 @@ function rowToDiscoveryDocument(row: Row): DiscoveryDocument {
 
 export async function getFavoriteListingIds(userId: string): Promise<Set<string>> {
   try {
-    const supabase = createClient();
+    const supabase = await createClient();
     const { data, error } = await (supabase as any).from("favorites").select("listing_id").eq("user_id", userId);
     if (error) throw error;
     return new Set((data ?? []).map((row: Row) => String(row.listing_id)));
@@ -102,7 +103,7 @@ export async function getFavoriteListingIds(userId: string): Promise<Set<string>
 
 export async function getFavoritesDashboard(userId: string): Promise<{ favorites: FavoriteDashboardItem[]; stats: Pick<SaveStats, "favoritesCount" | "alertCount" | "offerReadyCount">; source: "database" | "demo" }> {
   try {
-    const supabase = createClient();
+    const supabase = await createClient();
     const { data: favorites, error: favoritesError } = await (supabase as any)
       .from("favorites")
       .select("listing_id, created_at")
@@ -132,13 +133,16 @@ export async function getFavoritesDashboard(userId: string): Promise<{ favorites
       source: "database"
     };
   } catch {
+    if (!isDemoMarketplaceDataEnabled()) {
+      return { favorites: [], stats: { favoritesCount: 0, alertCount: 0, offerReadyCount: 0 }, source: "database" };
+    }
     const demo = (await searchMarketplace({ limit: 6 })).listings.map((listing) => ({ ...listing, favorited_at: listing.updated_at }));
     return { favorites: demo, stats: { favoritesCount: demo.length, alertCount: 3, offerReadyCount: demo.filter((listing) => listing.seller_trust_score >= 85).length }, source: "demo" };
   }
 }
 
 async function getRecentSavedSearchMatches(userId: string, searches: SavedSearchDashboardItem[]): Promise<SavedSearchMatchItem[]> {
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data: deliveries, error } = await (supabase as any)
     .from("saved_search_alert_deliveries")
     .select("id, saved_search_id, listing_id, notification_id, delivered_at")
@@ -186,7 +190,7 @@ async function getRecentSavedSearchMatches(userId: string, searches: SavedSearch
 
 export async function getSavedSearchesDashboard(userId: string): Promise<{ searches: SavedSearchDashboardItem[]; recentMatches: SavedSearchMatchItem[]; stats: Pick<SaveStats, "savedSearchCount" | "newMatchCount" | "digestCount">; source: "database" | "demo" }> {
   try {
-    const supabase = createClient();
+    const supabase = await createClient();
     const [{ data: searches, error: searchesError }, { data: deliveries, error: deliveriesError }, { data: notifications, error: notificationsError }] = await Promise.all([
       (supabase as any).from("saved_searches").select("*").eq("user_id", userId).order("updated_at", { ascending: false }),
       (supabase as any).from("saved_search_alert_deliveries").select("saved_search_id").eq("user_id", userId),
@@ -235,6 +239,9 @@ export async function getSavedSearchesDashboard(userId: string): Promise<{ searc
       source: "database"
     };
   } catch {
+    if (!isDemoMarketplaceDataEnabled()) {
+      return { searches: [], recentMatches: [], stats: { savedSearchCount: 0, newMatchCount: 0, digestCount: 0 }, source: "database" };
+    }
     const searches: SavedSearchDashboardItem[] = [
       { id: "00000000-0000-4000-8000-000000000001", name: "Carbon road bikes", query: "road bike carbon under 1500", filters: { maxPrice: 1500, category: "sports" }, alert_enabled: true, alert_frequency: "instant", last_notified_at: null, last_checked_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), match_count: 4, unread_notification_count: 2 },
       { id: "00000000-0000-4000-8000-000000000002", name: "Local MacBook pickup", query: "M1 MacBook Pro 14 local pickup", filters: { pickup_available: true }, alert_enabled: true, alert_frequency: "daily", last_notified_at: null, last_checked_at: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), match_count: 9, unread_notification_count: 1 }

@@ -1,8 +1,12 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { Banknote, Box, Send, Store } from "lucide-react";
 import { DashboardActionCard, DashboardListItem, DashboardShell, DashboardStatCard } from "@/components/dashboard-shell";
+import { EscrowActions } from "@/components/payments/escrow-actions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { getMarketplaceSession } from "@/lib/auth/session";
+import { loadE2ESales } from "@/lib/dev/e2e-fixtures";
 import { createClient } from "@/lib/supabase/server";
 import { formatMoney } from "@/lib/i18n/format";
 
@@ -37,7 +41,7 @@ function sellerNextStep(status: string) {
 }
 
 async function getSellerSales(userId: string) {
-  const supabase = createClient();
+  const supabase = await createClient();
   const { data } = await (supabase as any)
     .from("transactions")
     .select("id,listing_id,status,total_amount,marketplace_fee_amount,currency,updated_at")
@@ -47,19 +51,21 @@ async function getSellerSales(userId: string) {
   const transactions = (data ?? []) as SaleTransaction[];
   const transactionIds = transactions.map((transaction) => transaction.id);
   const listingIds = [...new Set(transactions.map((transaction) => transaction.listing_id))];
-  const [{ data: listings }, { data: payouts }] = await Promise.all([
+  const [{ data: listings }, { data: payouts }, { data: conversations }] = await Promise.all([
     listingIds.length ? (supabase as any).from("listings").select("id,title").in("id", listingIds) : Promise.resolve({ data: [] }),
-    transactionIds.length ? (supabase as any).from("payouts").select("transaction_id,status,amount,currency").in("transaction_id", transactionIds) : Promise.resolve({ data: [] })
+    transactionIds.length ? (supabase as any).from("payouts").select("transaction_id,status,amount,currency").in("transaction_id", transactionIds) : Promise.resolve({ data: [] }),
+    listingIds.length ? (supabase as any).from("conversations").select("id,listing_id").eq("seller_id", userId).in("listing_id", listingIds) : Promise.resolve({ data: [] })
   ]);
   const titleById = new Map(((listings ?? []) as Array<{ id: string; title: string }>).map((listing) => [listing.id, listing.title]));
   const payoutByTransaction = new Map(((payouts ?? []) as PayoutRow[]).map((payout) => [payout.transaction_id, payout]));
-  return transactions.map((transaction) => ({ ...transaction, title: titleById.get(transaction.listing_id) ?? "Marketplace sale", payout: payoutByTransaction.get(transaction.id) }));
+  const conversationByListing = new Map(((conversations ?? []) as Array<{ id: string; listing_id: string }>).map((conversation) => [conversation.listing_id, conversation.id]));
+  return transactions.map((transaction) => ({ ...transaction, title: titleById.get(transaction.listing_id) ?? "Marketplace sale", payout: payoutByTransaction.get(transaction.id), conversationId: conversationByListing.get(transaction.listing_id) }));
 }
 
 export default async function SalesPage() {
-  const supabase = createClient();
-  const { data: { user } } = await supabase.auth.getUser();
-  const sales = user ? await getSellerSales(user.id) : [];
+  const session = await getMarketplaceSession();
+  if (!session) redirect("/login?next=/dashboard/sales");
+  const sales = session.source === "supabase" ? await getSellerSales(session.id) : session.source === "e2e" ? await loadE2ESales(session.id) : [];
   const active = sales.filter((sale) => !["completed", "cancelled", "refunded"].includes(sale.status));
   const pendingPayout = sales.reduce((sum, sale) => sale.payout?.status === "pending" ? sum + Number(sale.payout.amount) : sum, 0);
   const completed = sales.filter((sale) => sale.status === "completed").length;
@@ -77,7 +83,8 @@ export default async function SalesPage() {
         <CardContent className="grid gap-3">
           {sales.length ? sales.map((sale) => (
             <DashboardListItem key={sale.id} title={sale.title} detail={`${money(sale.total_amount, sale.currency)} · ${sellerNextStep(sale.status)}`} status={sale.status}>
-              <Button asChild size="sm"><Link href="/dashboard/messages">Manage</Link></Button>
+              <Button asChild size="sm"><Link href={"conversationId" in sale && sale.conversationId ? `/dashboard/messages?conversation=${sale.conversationId}` : "/dashboard/messages"}>Manage</Link></Button>
+              <EscrowActions transactionId={sale.id} role="seller" status={sale.status} amount={Number(sale.total_amount)} currency={sale.currency} />
             </DashboardListItem>
           )) : (
             <div className="rounded-2xl border border-dashed border-border bg-secondary/50 p-5 text-sm text-muted-foreground">

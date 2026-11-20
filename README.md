@@ -6,7 +6,7 @@ Friction-Free Marketplace is an AI-powered consumer commerce platform built arou
 
 This is the single source repository for the complete product: the hosted Next.js web application and backend, the Android application, the iOS application, shared packages, database schema, infrastructure, CI, and store-release automation. Android and iOS are Capacitor packages of the same hosted product; they are not separate products or repositories.
 
-- **App Router + TypeScript:** public marketplace pages, authenticated dashboards, admin surfaces, API routes, and middleware.
+- **App Router + TypeScript:** public marketplace pages, authenticated dashboards, admin surfaces, and API routes. Next.js 16 uses `apps/web/proxy.ts` as the request proxy (the successor to `middleware.ts`).
 - **Tailwind CSS + shadcn/ui-style components:** reusable buttons, cards, forms, labels, inputs, badges, listing cards, dashboards, and shells.
 - **Supabase:** SSR/browser/admin clients, auth middleware, database types, RLS-oriented SQL migration, and seed categories.
 - **Stripe Connect:** seller onboarding, checkout/payment intent, escrow transaction routes, webhooks, refunds, disputes, and release flows.
@@ -31,6 +31,8 @@ GitHub repository
 └── .github         Web, Android, and iOS CI/release workflows
 ```
 
+Production launch steps, required environment names, and the host-only reset scripts are in [docs/LAUNCH.md](docs/LAUNCH.md).
+
 The web deployment is authoritative for marketplace data and server APIs. Both native applications securely load that HTTPS origin and add native behavior through Capacitor. Server secrets remain only in the hosted web/backend environment.
 
 The canonical native identity is:
@@ -48,8 +50,8 @@ apps/web/
   components/           shadcn/ui-style primitives and feature components
   lib/                  Supabase, Stripe, OpenAI, Meilisearch, Resend, PostHog, validation, and domain helpers
   tests/                Vitest unit tests and Playwright E2E specs
-  middleware.ts         Supabase session refresh and protected-route guards
-  .env.example          Local configuration template
+  proxy.ts              Request proxy: session checks and protected-route guards
+  ../../.env.example    Authoritative environment variable list
 
 apps/mobile/
   src/                  Native fallback/bridge source
@@ -86,13 +88,13 @@ docs/                   Product and technical architecture blueprints
    npm install
    ```
 
-2. Create local environment variables:
+2. Create local environment variables from the repository root. `.env.example` is the only variable list:
 
    ```bash
-   cp apps/web/.env.example apps/web/.env.local
+   cp .env.example apps/web/.env.local
    ```
 
-3. Fill in at least these values in `apps/web/.env.local`:
+3. Fill in the required values in `apps/web/.env.local`. Optional services (OpenAI, Meilisearch, Resend, and PostHog) can stay empty; the app degrades instead of crashing. Supabase and Stripe are required for live accounts and checkout:
 
    ```bash
    NEXT_PUBLIC_APP_URL=http://localhost:3001
@@ -142,6 +144,14 @@ npm run platform:build  # Build shared code, hosted web, and portable mobile bri
 npm run platform:sync   # Verify and sync Capacitor Android/iOS projects
 ```
 
+## Vercel layout
+
+`vercel.json` lives at the repository root and runs `npm ci` and `npm run web:build` from that root. Set the Vercel project's Root Directory to the repository root, not `apps/web`. A root of `apps/web` would not see the root file. `apps/web/vercel.json` repeats the same cron paths so a project rooted at `apps/web` still schedules reconcile and auto-release.
+
+Scheduled routes are Vercel Cron GET requests. Set `CRON_SECRET` (sent as `Authorization: Bearer`) or the route's own bearer secret (`SCHEDULED_JOB_SECRET` for notifications, offer expiry, and `/api/payments/reconcile`, `SEARCH_SYNC_SECRET` for search sync). A missing secret returns 503. Reconcile repairs escrow rows stuck in capturing, releasing, or refunding for more than 10 minutes.
+
+Public image build arguments are required. Pass `NEXT_PUBLIC_APP_URL`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` to `docker build`. The image does not bake placeholder values for those variables.
+
 ## Production deployment
 
 The full Next.js application can deploy from GitHub to Vercel or as the included Docker image. Android and iOS projects live in `apps/mobile`; they require a deployed HTTPS web origin and store credentials. See [docs/production-release.md](docs/production-release.md) for the complete web, Play Store, and App Store procedure.
@@ -149,6 +159,31 @@ The full Next.js application can deploy from GitHub to Vercel or as the included
 The current evidence, weighted readiness score, and release blockers are tracked in [docs/production-readiness-scorecard.md](docs/production-readiness-scorecard.md). Run `npm run release:check` for the portable application checks; GitHub Actions additionally validates Docker, Supabase, Android, iOS, browser, and artifact-specific requirements.
 
 After deploying a real HTTPS origin, run `PRODUCTION_URL=https://market.yourdomain.com npm run production:smoke` with the actual hostname. The manual “Production proof” workflow records public-origin and browser evidence. Use [docs/release-evidence-template.md](docs/release-evidence-template.md) to prove the authenticated buyer, seller, protected-payment, trust, and real-device journeys before promotion.
+
+## Architecture
+
+The hosted product is `apps/web`, a Next.js App Router application. `packages/shared` holds code shared with other workspaces. `apps/mobile` is a Capacitor shell around the same hosted origin. `supabase/migrations` is the database history; `database/migrations` is reference material and is not applied on its own.
+
+`apps/web/proxy.ts` runs on each matched request. It checks mutation origins and redirects unauthenticated visitors away from dashboard, admin, and account pages. API handlers still check the caller themselves. A local auth bypass exists only when `ALLOW_DEV_AUTH_BYPASS=true`, the process is not production, Vercel, or CI, the Host is loopback, and the bypass cookie is present. It never grants admin.
+
+The document language follows the signed-in profile locale, then the browser language, and otherwise English left-to-right. There is no translation catalog yet.
+
+## Mobile and installed web app
+
+The web app uses one phone shell at every width. On a larger screen the same column is centered at about 480px, with a neutral backdrop around it. Admin pages use the same bar and tabs in a slightly wider column so tables stay readable. A bottom tab bar (Home, Search, Sell, Messages, Account) and a compact top bar with back navigation are always present. Listing checkout stays sticky above that bar. `apps/web/public/sw.js` serves the offline page for public navigations and never caches `/api` or signed-in routes. The Capacitor projects in `apps/mobile` keep loading the hosted web origin. Nothing in this repository publishes a store build.
+
+## Marketplace MCP
+
+`/api/mcp` is a Streamable HTTP Model Context Protocol endpoint. It stays off unless `FFM_MCP_ENABLED=1`. Discovery is `GET /.well-known/mcp`.
+
+Public read-only tools:
+
+- `search_listings` with query, category, price range, and location
+- `get_listing`
+- `get_seller_public_profile`
+- `list_categories`
+
+These tools return public listing and profile fields only. They do not create payments, refunds, or payouts. Authenticated tools (`my_listings`, `my_offers`, `my_orders`, `create_offer`) are not enabled. The planned path is a per-user Supabase bearer token checked with row-level security, never the service-role key, and `create_offer` would require a second confirmation call.
 
 ## Database notes
 
